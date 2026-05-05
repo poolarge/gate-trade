@@ -45,6 +45,10 @@ class MockStateMachine(StateMachine):
         self._state = BotState.COOLDOWN_SELF_TRADE
         self._cooldown_remaining = duration_ms
 
+    def start_cooldown_price_spike(self, duration_ms: int) -> None:
+        self._state = BotState.COOLDOWN_PRICE_SPIKE
+        self._cooldown_remaining = duration_ms
+
     def cooldown_remaining_ms(self) -> int:
         return self._cooldown_remaining
 

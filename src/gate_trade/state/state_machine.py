@@ -17,10 +17,11 @@ logger = structlog.get_logger(__name__)
 _VALID_TRANSITIONS: dict[BotState, frozenset[BotState]] = {
     BotState.INIT:                  frozenset({BotState.IDLE}),
     BotState.IDLE:                  frozenset({BotState.RUNNING, BotState.EMERGENCY, BotState.SHUTDOWN}),
-    BotState.RUNNING:               frozenset({BotState.IDLE, BotState.COOLDOWN_FILL, BotState.COOLDOWN_CANCEL, BotState.COOLDOWN_SELF_TRADE, BotState.EMERGENCY, BotState.RECONNECT}),
+    BotState.RUNNING:               frozenset({BotState.IDLE, BotState.COOLDOWN_FILL, BotState.COOLDOWN_CANCEL, BotState.COOLDOWN_SELF_TRADE, BotState.COOLDOWN_PRICE_SPIKE, BotState.EMERGENCY, BotState.RECONNECT}),
     BotState.COOLDOWN_FILL:         frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
     BotState.COOLDOWN_CANCEL:       frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
     BotState.COOLDOWN_SELF_TRADE:   frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
+    BotState.COOLDOWN_PRICE_SPIKE:  frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
     BotState.EMERGENCY:             frozenset({BotState.IDLE, BotState.SHUTDOWN}),
     BotState.SHUTDOWN:              frozenset(),
     BotState.RECONNECT:             frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
@@ -30,6 +31,7 @@ _COOLDOWN_STATES: frozenset[BotState] = frozenset({
     BotState.COOLDOWN_FILL,
     BotState.COOLDOWN_CANCEL,
     BotState.COOLDOWN_SELF_TRADE,
+    BotState.COOLDOWN_PRICE_SPIKE,
 })
 
 
@@ -104,6 +106,9 @@ class LiveStateMachine(StateMachine):
 
     def start_cooldown_self_trade(self, duration_ms: int) -> None:
         self._enter_cooldown(BotState.COOLDOWN_SELF_TRADE, duration_ms)
+
+    def start_cooldown_price_spike(self, duration_ms: int) -> None:
+        self._enter_cooldown(BotState.COOLDOWN_PRICE_SPIKE, duration_ms)
 
     def cooldown_remaining_ms(self) -> int:
         if self._cooldown_until <= 0:

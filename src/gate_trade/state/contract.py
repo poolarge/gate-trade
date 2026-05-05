@@ -53,6 +53,10 @@ class StateMachine(Protocol):
         """Enter COOLDOWN_SELF_TRADE for *duration_ms* ms."""
         ...
 
+    def start_cooldown_price_spike(self, duration_ms: int) -> None:
+        """Enter COOLDOWN_PRICE_SPIKE for *duration_ms* ms."""
+        ...
+
     def cooldown_remaining_ms(self) -> int:
         """Remaining ms in current cooldown, or 0 if not in a cooldown state."""
         ...
