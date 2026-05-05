@@ -76,7 +76,7 @@ class ReplayEngine:
         for req in self._strategy.desired_orders():
             fill_price = self._crosses_market(req, snap)
             if fill_price is not None:
-                self._simulate_fill(req, fill_price, snap.timestamp)
+                self._simulate_fill(req, fill_price, snap.timestamp, snap.mid_price)
 
         # Process completed markout entries
         for record in self._markout.completed():
@@ -100,18 +100,20 @@ class ReplayEngine:
             return snap.best_bid
         return None
 
-    def _simulate_fill(self, req: OrderRequest, fill_price: float, timestamp: float) -> None:
+    def _simulate_fill(
+        self, req: OrderRequest, fill_price: float, timestamp: float, mid_price: float
+    ) -> None:
         """Record a simulated fill through markout and metrics."""
         order = Order(
             order_id=f"replay_{timestamp}_{req.side.value}",
             pair=req.pair,
             side=req.side,
-            price=req.price,
+            price=fill_price,
             size=req.size,
             filled_size=req.size,
             status=OrderStatus.CLOSED,
         )
-        self._markout.on_fill(order, req.size, fill_price)
+        self._markout.on_fill(order, req.size, mid_price, timestamp=timestamp)
         self._metrics.record_fill(req.side, fill_price, req.size, timestamp)
 
     def reset(self) -> None:

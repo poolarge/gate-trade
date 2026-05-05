@@ -50,8 +50,11 @@ class MarkoutRecorder:
         self._last_mid: float = 0.0
         self._last_mid_time: float = 0.0
 
-    def on_fill(self, order: Order, filled_size: float, mid_price: float) -> None:
-        now = time.monotonic()
+    def on_fill(
+        self, order: Order, filled_size: float, mid_price: float,
+        timestamp: float | None = None,
+    ) -> None:
+        now = timestamp if timestamp is not None else time.monotonic()
         record = MarkoutRecord(
             order_id=order.order_id,
             side=order.side,
