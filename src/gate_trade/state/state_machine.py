@@ -17,14 +17,14 @@ logger = structlog.get_logger(__name__)
 _VALID_TRANSITIONS: dict[BotState, frozenset[BotState]] = {
     BotState.INIT:                  frozenset({BotState.IDLE}),
     BotState.IDLE:                  frozenset({BotState.RUNNING, BotState.EMERGENCY, BotState.SHUTDOWN}),
-    BotState.RUNNING:               frozenset({BotState.IDLE, BotState.COOLDOWN_FILL, BotState.COOLDOWN_CANCEL, BotState.COOLDOWN_SELF_TRADE, BotState.COOLDOWN_PRICE_SPIKE, BotState.EMERGENCY, BotState.RECONNECT}),
-    BotState.COOLDOWN_FILL:         frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
-    BotState.COOLDOWN_CANCEL:       frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
-    BotState.COOLDOWN_SELF_TRADE:   frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
-    BotState.COOLDOWN_PRICE_SPIKE:  frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
+    BotState.RUNNING:               frozenset({BotState.IDLE, BotState.COOLDOWN_FILL, BotState.COOLDOWN_CANCEL, BotState.COOLDOWN_SELF_TRADE, BotState.COOLDOWN_PRICE_SPIKE, BotState.EMERGENCY, BotState.RECONNECT, BotState.SHUTDOWN}),
+    BotState.COOLDOWN_FILL:         frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY, BotState.SHUTDOWN}),
+    BotState.COOLDOWN_CANCEL:       frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY, BotState.SHUTDOWN}),
+    BotState.COOLDOWN_SELF_TRADE:   frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY, BotState.SHUTDOWN}),
+    BotState.COOLDOWN_PRICE_SPIKE:  frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY, BotState.SHUTDOWN}),
     BotState.EMERGENCY:             frozenset({BotState.IDLE, BotState.SHUTDOWN}),
     BotState.SHUTDOWN:              frozenset(),
-    BotState.RECONNECT:             frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY}),
+    BotState.RECONNECT:             frozenset({BotState.IDLE, BotState.RUNNING, BotState.EMERGENCY, BotState.SHUTDOWN}),
 }
 
 _COOLDOWN_STATES: frozenset[BotState] = frozenset({

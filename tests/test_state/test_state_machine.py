@@ -202,17 +202,17 @@ class TestTransitionMatrix:
         (BotState.RUNNING, BotState.COOLDOWN_PRICE_SPIKE, True),
         (BotState.RUNNING, BotState.EMERGENCY, True),
         (BotState.RUNNING, BotState.RECONNECT, True),
-        (BotState.RUNNING, BotState.SHUTDOWN, False),
+        (BotState.RUNNING, BotState.SHUTDOWN, True),
         # COOLDOWN_FILL → *
         (BotState.COOLDOWN_FILL, BotState.RUNNING, True),
         (BotState.COOLDOWN_FILL, BotState.IDLE, True),
         (BotState.COOLDOWN_FILL, BotState.EMERGENCY, True),
-        (BotState.COOLDOWN_FILL, BotState.SHUTDOWN, False),
+        (BotState.COOLDOWN_FILL, BotState.SHUTDOWN, True),
         # COOLDOWN_PRICE_SPIKE → *
         (BotState.COOLDOWN_PRICE_SPIKE, BotState.RUNNING, True),
         (BotState.COOLDOWN_PRICE_SPIKE, BotState.IDLE, True),
         (BotState.COOLDOWN_PRICE_SPIKE, BotState.EMERGENCY, True),
-        (BotState.COOLDOWN_PRICE_SPIKE, BotState.SHUTDOWN, False),
+        (BotState.COOLDOWN_PRICE_SPIKE, BotState.SHUTDOWN, True),
         # EMERGENCY → *
         (BotState.EMERGENCY, BotState.IDLE, True),
         (BotState.EMERGENCY, BotState.SHUTDOWN, True),

@@ -13,12 +13,12 @@ import asyncio
 import os
 from pathlib import Path
 
+from gate_trade.config.schema import AppConfig
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _load_config(yaml_path: str) -> "AppConfig":
-    from gate_trade.config.schema import AppConfig
-
+def _load_config(yaml_path: str) -> AppConfig:
     base = Path(yaml_path)
     local = base.parent / "local.yaml"
     config = AppConfig.from_yaml_merged(base, local)

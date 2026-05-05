@@ -99,6 +99,8 @@ class Bot:
         """Start the main loop. Blocks until shutdown."""
         self._running = True
         self._start_time = time.monotonic()
+        if self._sm.state == BotState.INIT:
+            self._sm.transition(BotState.IDLE)
         self._sm.transition(BotState.RUNNING)
 
         loop = asyncio.get_running_loop()
@@ -291,20 +293,20 @@ class Bot:
     async def _alert_critical(self, msg: str) -> None:
         if self._alert:
             try:
-                await self._alert.critical(msg)
+                await self._alert.critical("Gate Trade Critical", msg)
             except Exception:
                 logger.warning("alert_failed")
 
     async def _alert_warn(self, msg: str) -> None:
         if self._alert:
             try:
-                await self._alert.warn(msg)
+                await self._alert.warn("Gate Trade Warning", msg)
             except Exception:
                 logger.warning("alert_failed")
 
     async def _alert_info(self, msg: str) -> None:
         if self._alert:
             try:
-                await self._alert.info(msg)
+                await self._alert.info("Gate Trade Info", msg)
             except Exception:
                 logger.warning("alert_failed")
