@@ -1,0 +1,38 @@
+# Gate Trade — default configuration (v1.0)
+# Override via environment or config/local.yaml
+
+exchange:
+  name: gate
+  base_url: https://api.gateio.ws/api/v4
+  ws_url: wss://ws.gateio.ws/v4/
+
+trading:
+  target_pair: TARGET_USDT  # override per deployment
+  base_inventory: 0.0
+  quote_inventory: 0.0
+
+risk:
+  max_position_notional: 100.0       # USD
+  max_order_size_notional: 50.0      # USD
+  max_open_orders: 10
+  cooldown_fill_ms: 2000
+  cooldown_cancel_ms: 1000
+  cooldown_self_trade_ms: 5000
+
+rate_limit:
+  burst: 10
+  rate: 8.0          # tokens/sec refill
+  max_wait_sec: 5.0
+
+ws:
+  ping_interval_sec: 15
+  reconnect_delay_sec: 2.0
+  max_reconnect_attempts: 0  # unlimited
+
+logging:
+  level: INFO
+  json_format: true
+
+monitoring:
+  alert_webhook_url: ""  # e.g. Slack/Discord webhook
+  daily_report: true

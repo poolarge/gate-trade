@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:api.gateio.ws)",
+      "WebFetch(domain:www.gateio.ws)",
+      "WebFetch(domain:www.gate.io)",
+      "WebSearch",
+      "Bash(curl -s 'https://api.gateio.ws/api/v4/spot/currency_pairs?currency_pair=QKA_USDT')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s 'https://api.gateio.ws/api/v4/spot/order_book?currency_pair=QKA_USDT&limit=50')",
+      "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\); [print\\(json.dumps\\(item,indent=2\\)\\) for item in data if item.get\\('id'\\)=='QKA_USDT']\")",
+      "Bash(curl -s 'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=QKA_USDT')",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 *)",
+      "Bash(pip3 list *)",
+      "Bash(printenv)",
+      "Read(//home/monero/.claude/**)",
+      "WebFetch(domain:api-docs.deepseek.com)",
+      "Bash(chmod +x /home/monero/.local/bin/switch-claude)",
+      "Bash(echo 'export PATH=\"$HOME/.local/bin:$PATH\"')",
+      "Bash(export PATH=\"$HOME/.local/bin:$PATH\")",
+      "Bash(switch-claude list *)",
+      "Bash(switch-claude current *)",
+      "Bash(/home/monero/.local/bin/switch-claude current *)",
+      "Bash(ln -sf /home/monero/.claude/profiles/xfyun.json /home/monero/.claude/profiles/current)",
+      "Bash(/home/monero/.local/bin/switch-claude deepseek *)",
+      "WebFetch(domain:claude.luluta.org)"
+    ]
+  }
+}
