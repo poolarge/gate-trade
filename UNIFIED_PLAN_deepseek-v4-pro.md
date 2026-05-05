@@ -2,7 +2,7 @@
 
 **审计来源**: Deepseek-v4-pro + Codex  
 **日期**: 2026-05-05  
-**项目**: `https://github.com/mudyman/gate-trade`  
+**项目**: `https://github.com/poolarge/gate-trade`
 **状态**: 不建议直接运行实盘，先完成本计划
 
 ---

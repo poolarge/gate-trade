@@ -3,7 +3,7 @@
 **审计来源**: Deepseek-v4-pro + DS + Codex（三方审计合并）  
 **审计日期**: 2026-05-05  
 **项目版本**: 0.1.0  
-**项目仓库**: `https://github.com/mudyman/gate-trade`  
+**项目仓库**: `https://github.com/poolarge/gate-trade`
 **本地路径**: `/home/monero/gate-trade`  
 **审计范围**: 全部 Python 源文件（70个）、测试文件（83个，469个测试）、配置、脚本、部署文件
 
@@ -593,7 +593,7 @@ MarketData, OrderEngine, SqlitePersistence, RefPriceEngine, RiskManager, StateMa
 ### Codex 实际运行命令
 
 ```bash
-git clone https://github.com/mudyman/gate-trade.git .
+git clone https://github.com/poolarge/gate-trade.git .
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/pip install httpx bandit pip-audit

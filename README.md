@@ -5,7 +5,7 @@ Spot unilateral accumulation + market-making bot for Gate.io.
 ## 部署
 
 ```bash
-git clone https://github.com/mudyman/gate-trade.git
+git clone https://github.com/poolarge/gate-trade.git
 cd gate-trade
 python3 -m venv .venv
 .venv/bin/pip install -e .
