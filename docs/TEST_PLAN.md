@@ -271,95 +271,545 @@
 
 ---
 
-## Phase 4: Live 灰度假值测试
+## Phase 4: 实盘测试方案
 
-> **前置**: Phase 1-3 全部通过后，且 API 密钥已就绪，才进入此阶段。
-> **原则**: 规模逐级放大，每阶段通过后才进入下一阶段。
-
-### 4.0 前置确认清单
-
-| # | 检查项 | 确认方式 |
-|---|--------|---------|
-| 4.0.1 | Gate.io API Key 已创建，有交易权限 | Gate.io Web → API Management |
-| 4.0.2 | API Key 已绑定 IP 白名单 | Gate.io Web → API Management → IP Whitelist |
-| 4.0.3 | API Secret 仅通过环境变量注入 | `env \| grep GATE_EXCHANGE__API` 确认存在 |
-| 4.0.4 | 交易对已确定 | 用户确认（如 BTC_USDT） |
-| 4.0.5 | 可用余额充足（USDT） | Gate.io Wallet 页面 |
-| 4.0.6 | 止损方案已确认 | 手动盯盘 / 脚本自动撤单 |
-| 4.0.7 | 紧急撤单方式已确认 | Gate.io Web 一键撤单 / API 撤单命令 |
-
-### 4.1 阶段 4A: Preflight Only（10 秒，不挂单）
-
-| 项 | 内容 |
-|----|------|
-| **测试内容** | 验证 WS 连接 → 行情接收 → 余额获取 → 订单对账流程全部通过，但不产生实际挂单 |
-| **为什么** | 这是实盘的第一道防线。preflight 成功说明网络、鉴权、行情、余额全链路通。duration=10s 和 tick_interval=0.5s 约 20 个 tick，但由于 tick 中 dry_run=False 才会下单，我们需确认 duration 足够短不至于积累大量订单。实际上下单条件取决于 strategy desired orders 是否为空。缩短 duration 降低风险。 |
-| **怎么测试** | ```bash<br>GATE_EXCHANGE__API_KEY=$KEY GATE_EXCHANGE__API_SECRET=$SECRET \<br>.venv/bin/python scripts/run.py --live --pair BTC_USDT --duration 10 --tick-interval 0.5 --data-dir data 2>&1<br>``` |
-| **关键日志检查** | `preflight_ws_ready` → `preflight_market_data_ready` → `preflight_balances (count>0)` → `preflight_reconcile` → `preflight_passed` |
-| **通过标准** | (1) 四个 preflight 阶段全部打印成功日志 (2) mid 价格合理（非 0 非负数）(3) balances 返回正确的余额 (4) 无 API 错误 |
-
-### 4.2 阶段 4B: 极小单测试（30 秒，$0.001 BTC ≈ $50）
-
-| 项 | 内容 |
-|----|------|
-| **测试内容** | 以最小 notional 挂单，验证完整的 下单→成交/撤单 闭环 |
-| **为什么** | 验证下单路径完全正常：价格对齐、tag 生成、限速检查、价格边界、提交到交易所、本地状态跟踪、关机撤单。这是从 0 到 1 的关键一步。 |
-| **参数配置** | `config/local.yaml`：<br>```yaml<br>risk:<br>  max_order_size_notional: 1.0<br>  max_position_notional: 10.0<br>  max_open_orders: 2<br>``` |
-| **怎么测试** | ```bash<br>GATE_EXCHANGE__API_KEY=$KEY GATE_EXCHANGE__API_SECRET=$SECRET \<br>.venv/bin/python scripts/run.py --live --pair BTC_USDT --duration 30 --tick-interval 0.5 --data-dir data 2>&1<br>``` |
-| **验证点** |  |
-| 通过标准 | (1) 至少 1 个 `order_placed` 日志 (2) 订单价格在合理范围 (3) `bot_shutting_down` 后 `order_cancelled` 或 `all_cancelled` 日志 (4) 交易所挂单列表为空（登录 Gate.io 确认）(5) 无 error 级别日志 |
-
-### 4.3 阶段 4C: 常规规模测试（10 分钟，多单）
-
-| 项 | 内容 |
-|----|------|
-| **测试内容** | 以常规规模运行 10 分钟，验证多单管理、风控行为、长时间稳定性 |
-| **为什么** | 验证系统在真实场景下的表现：风控是否产生假阳性、cooldown 机制是否正常工作、是否有内存泄漏。 |
-| **参数配置** | ```yaml<br>risk:<br>  max_order_size_notional: 10.0<br>  max_position_notional: 50.0<br>  max_open_orders: 5<br>``` |
-| **怎么测试** | ```bash<br>GATE_EXCHANGE__API_KEY=$KEY GATE_EXCHANGE__API_SECRET=$SECRET \<br>.venv/bin/python scripts/run.py --live --pair BTC_USDT --duration 600 --tick-interval 0.5 --data-dir data 2>&1 \| tee /tmp/gate_live_4c.log<br>``` |
-| **通过标准** | (1) 运行满 10 分钟无 crash (2) 风控无假阳性 halt（检查无 `risk_halt` 或若出现则检查原因是否合理）(3) 如有 spike → cooldown 在 5s 内恢复 (4) fills 表有成交或 markout 数据 (5) 无 429 rate limit 错误 (6) shutdown 撤单干净 |
+> **准入条件**: Phase 1-3 全部通过，API 密钥已就绪。
+> **核心原则**: 规模逐级放大，每阶段通过后才进入下一阶段。每笔订单金额可控、可追溯、可立即撤单。
+> **测试账户**: Gate.io 现货账户，建议单独创建 API Key 专用于测试。
 
 ---
 
-## Phase 5: 异常场景测试
+### 4.0 前置准备
 
-测试系统在异常条件下的容错和恢复能力。
+#### 4.0.1 环境变量配置
 
-### T5.1 — WS 断线重连
+| 变量 | 说明 | 设置方式 |
+|------|------|---------|
+| `GATE_EXCHANGE__API_KEY` | Gate.io API Key | `export`，**禁止写入文件** |
+| `GATE_EXCHANGE__API_SECRET` | Gate.io API Secret | `export`，**禁止写入文件** |
+| `GATE_WEB_TOKEN` | Panel 认证 token | `export`，可选但建议 |
+| `GATE_WEB_HOST` | Panel 绑定地址 | 默认 127.0.0.1 |
+
+```bash
+# 设置示例（不要直接在命令行输入，通过密码管理器或安全方式导入）
+export GATE_EXCHANGE__API_KEY="your_api_key_here"
+export GATE_EXCHANGE__API_SECRET="your_api_secret_here"
+export GATE_WEB_TOKEN="$(openssl rand -hex 16)"
+```
+
+#### 4.0.2 风控参数配置
+
+创建实盘专用配置 `config/live.yaml`：
+
+```yaml
+# config/live.yaml — 实盘测试配置（gitignore，不提交）
+exchange:
+  api_key: ""    # 留空，通过环境变量注入
+  api_secret: "" # 留空，通过环境变量注入
+
+trading:
+  target_pair: BTC_USDT
+  base_inventory: 0.0
+  quote_inventory: 0.0
+
+risk:
+  max_position_notional: 10.0       # 初始极小值，逐阶段放大
+  max_order_size_notional: 1.0      # 初始极小值
+  max_open_orders: 2                # 初始极小值
+  cooldown_fill_ms: 2000
+  cooldown_cancel_ms: 1000
+  cooldown_self_trade_ms: 5000
+  flash_crash_threshold_pct: 5.0
+
+rate_limit:
+  burst: 10
+  rate: 8.0
+  max_wait_sec: 5.0
+```
+
+#### 4.0.3 前置确认清单
+
+| # | 检查项 | 确认方式 | 状态 |
+|---|--------|---------|------|
+| E1 | API Key 已创建，有 Spot 交易权限 | Gate.io → API Management → 权限列表 | [ ] |
+| E2 | API Key 已绑定 IP 白名单 | Gate.io → API Management → IP Whitelist | [ ] |
+| E3 | API Secret 仅通过环境变量注入，不在任何文件明文 | `grep -r "$SECRET" config/ src/` 无输出 | [ ] |
+| E4 | 交易对存在且有足够流动性 | Gate.io 市场页面确认 BTC_USDT 日成交量 | [ ] |
+| E5 | 账户有足够 USDT 余额（≥ $100 用于测试） | Gate.io Wallet 页面 | [ ] |
+| E6 | 面板认证 token 已设置 | `echo $GATE_WEB_TOKEN` 非空 | [ ] |
+| E7 | 紧急撤单方式已确认并测试 | 登录 Gate.io Web → 手动撤单功能可用 | [ ] |
+| E8 | 监控面板可访问 | 浏览器打开 http://127.0.0.1:39120 | [ ] |
+| E9 | `config/live.yaml` 中风险参数已设为最小值 | 检查 max_position=10, max_order=1, max_orders=2 | [ ] |
+
+---
+
+### 4.1 阶段 A: API 密钥验证
+
+验证密钥有效性和基本连通性，**不启动 bot 主循环**。
 
 | 项 | 内容 |
 |----|------|
-| **测试内容** | 模拟 WebSocket 连接断开，验证自动重连和状态恢复 |
-| **为什么** | 生产环境中 WS 断线是常见现象。v0.1.0：WS 重连逻辑存在但未验证。v0.2.0：后台 reconnect task 应在断线后自动重连并恢复订阅。 |
-| **怎么测试** | (仅 live) 运行时用 `iptables` 临时阻断到 `ws.gateio.ws` 的出站连接，30 秒后恢复，观察日志 |
-| **预期行为** | RECONNECT 状态 → 自动重连成功 → 恢复 RUNNING → 行情数据恢复 |
+| **测试内容** | 密钥格式验证 + 空密钥拒绝 + 交易所 API 连通性 |
+| **为什么** | v0.1.0 CRITICAL 3.1：API 密钥明文存储，空密钥或默认值 `REPLACE_ME` 不拒绝，导致启动后全是认证错误。修复后 (1) 密钥通过环境变量注入 (2) 空密钥启动立即 `sys.exit(1)` (3) 不向日志输出密钥内容。 |
+| **怎么测试** | |
 
-### T5.2 — API 限频降级
+**T4A.1 — 空密钥拒绝**
+
+```bash
+# 确认环境变量未设置
+unset GATE_EXCHANGE__API_KEY
+unset GATE_EXCHANGE__API_SECRET
+.venv/bin/python scripts/run.py --live --pair BTC_USDT --duration 5 2>&1; echo "exit=$?"
+```
+
+| 通过标准 | (1) 打印 `ERROR: API key not configured` (2) exit code = 1 (3) 无任何网络请求 |
+
+**T4A.2 — 密钥格式检查**
+
+```bash
+# 检查密钥不为默认值
+[ "$GATE_EXCHANGE__API_KEY" != "REPLACE_ME" ] && echo "OK: key set" || echo "FAIL: key is default"
+[ -n "$GATE_EXCHANGE__API_SECRET" ] && echo "OK: secret set" || echo "FAIL: secret empty"
+```
+
+| 通过标准 | (1) key 非空 (2) key 非 REPLACE_ME (3) secret 非空 |
+
+**T4A.3 — 交易所连通性**
+
+```bash
+# 用 curl 测试连通（不通过 bot 代码）
+curl -s -H "KEY: $GATE_EXCHANGE__API_KEY" \
+  "https://api.gateio.ws/api/v4/spot/accounts" 2>&1 | head -5
+```
+
+| 通过标准 | 返回 JSON 数组，包含账户余额数据，无 401/403 |
+
+---
+
+### 4.2 阶段 B: Preflight 全链路（无挂单，15 秒）
 
 | 项 | 内容 |
 |----|------|
-| **测试内容** | 令牌桶耗尽后的行为 |
-| **为什么** | v0.1.0：`acquire()` 超时 raise `RateLimitExceeded` 硬错误。v0.2.0：返回 False，order engine 记录 warning 并跳过当前 placement。 |
-| **怎么测试** | 检查 `rate_limiter.py: acquire()` 返回 False（非 raise） |
-| **通过标准** | 遇到限频时日志 `rate_limit_skip` warning，不 crash |
+| **测试内容** | 走完完整 preflight 流程（WS 连接 → 行情数据 → 余额获取 → 订单对账），在 bot 进入主循环后马上停止，**确保不产生任何挂单** |
+| **为什么** | v0.1.0 FATAL 2.1：`WsManager.connect()` 阻塞导致 preflight 之前的代码都跑不到。修复后 connect 非阻塞 + preflight 四步检查。15 秒内 strategy 可能下发 1-2 个 desired order，需关注。 |
+| **怎么测试** | |
 
-### T5.3 — 数据库写入失败
+```bash
+GATE_EXCHANGE__API_KEY=$KEY GATE_EXCHANGE__API_SECRET=$SECRET \
+  .venv/bin/python scripts/run.py \
+  --live --pair BTC_USDT \
+  --duration 15 --tick-interval 0.5 \
+  --config config/live.yaml \
+  --data-dir data/live_test \
+  2>&1 | tee /tmp/gate_4b.log
+```
+
+**关键日志逐条检查**:
+
+| 序号 | 预期日志 | 验证点 |
+|------|---------|--------|
+| 1 | `live_mode_initializing` | 启动流程开始 |
+| 2 | `preflight_start` | preflight 进入 |
+| 3 | `preflight_ws_ready` | WS 连接成功（非阻塞 connect 修复） |
+| 4 | `preflight_market_data_ready, mid=XXXXX` | 行情数据到达（dispatch key 匹配修复） |
+| 5 | `preflight_balances, count=N (N>0)` | 余额获取成功（真实余额传入风控） |
+| 6 | `preflight_orders_clean` 或 `preflight_orphans` | reconcile 完成 |
+| 7 | `preflight_passed` | 四步全过 |
+| 8 | `bot_started` | Bot 进入主循环 |
+
+**通过标准**:
+- [ ] 7 条关键日志全部出现
+- [ ] mid 价格与交易所实时价格一致（偏差 < 0.5%）
+- [ ] balances count ≥ 1
+- [ ] 无 `error` 级别日志（`spike_detected` warning 除外）
+- [ ] 日志中无 `order_placed`（无实际下单）
+- [ ] 进程正常退出 code 0
+
+---
+
+### 4.3 阶段 C: 单订单生命周期（30 秒，最小金额）
 
 | 项 | 内容 |
 |----|------|
-| **测试内容** | 数据库只读或磁盘满时，主循环不 crash |
-| **为什么** | DB 写入失败不应导致交易循环崩溃。错误应被捕获并记录。 |
-| **怎么测试** | (dry-run) `chmod 444 data/gate_trade.db` 后运行，观察 behavior |
-| **预期行为** | 日志 error，但主循环继续运行，tick 不中断 |
+| **测试内容** | 下发**单笔最小金额订单**，验证 下单→交易所确认→本地跟踪→撤单 完整闭环 |
+| **为什么** | 这是从 0 到 1 的关键一步。验证：(1) Gate.io 下单 API 正确调用 (2) 订单在交易所可见 (3) 本地状态与交易所一致 (4) client_order_id tag 正确设置 (5) 关机撤单生效 (6) 价格在 ref_price ±20% 保护范围内 (7) 限速令牌桶正常工作。 |
+| **风控参数** | `max_order_size_notional: 1.0`（≈ $1 极小单），`max_open_orders: 1` |
+| **怎么测试** | |
 
-### T5.4 — 进程 crash 后状态恢复
+**配置调整**: 修改 `config/live.yaml`：
+```yaml
+risk:
+  max_order_size_notional: 1.0    # $1 极小单
+  max_position_notional: 5.0
+  max_open_orders: 1
+```
+
+```bash
+GATE_EXCHANGE__API_KEY=$KEY GATE_EXCHANGE__API_SECRET=$SECRET \
+  .venv/bin/python scripts/run.py \
+  --live --pair BTC_USDT \
+  --duration 30 --tick-interval 0.5 \
+  --config config/live.yaml \
+  --data-dir data/live_test \
+  2>&1 | tee /tmp/gate_4c.log
+```
+
+**运行中操作**（另一个终端）:
+
+```bash
+# 实时查看 bot 状态
+watch -n 2 'curl -s http://127.0.0.1:39120/api/snapshot | python3 -m json.tool'
+
+# 查看挂单
+watch -n 2 "curl -s -H 'KEY: $GATE_EXCHANGE__API_KEY' \
+  'https://api.gateio.ws/api/v4/spot/open_orders?currency_pair=BTC_USDT' | python3 -m json.tool"
+```
+
+**关机后验证**:
+
+```bash
+# 1. 确认交易所挂单已全部取消
+curl -s -H "KEY: $GATE_EXCHANGE__API_KEY" \
+  "https://api.gateio.ws/api/v4/spot/open_orders?currency_pair=BTC_USDT"
+
+# 2. 检查数据库中的订单记录
+sqlite3 data/live_test/gate_trade.db \
+  "SELECT order_id, side, price, size, status FROM orders"
+
+# 3. 检查事件日志
+sqlite3 data/live_test/gate_trade.db \
+  "SELECT event_type, json_extract(event_data, '$.side') as side FROM event_log WHERE event_type='order_place'"
+```
+
+**通过标准**:
+- [ ] 至少 1 条 `order_placed` 日志
+- [ ] order_placed 日志中 `price` 在 ref_price ±20% 范围内
+- [ ] 订单在交易所可见（curl 返回非空列表）
+- [ ] shutdown 日志中 `all_cancelled, count=1` 或逐个 `order_cancelled`
+- [ ] shutdown 后交易所 open_orders 返回空数组 `[]`
+- [ ] DB orders 表中订单状态为 `cancelled`
+- [ ] 无 `error` 级别日志
+- [ ] `rate_limit_skip` 出现不超过 2 次（限频为正常行为）
+
+---
+
+### 4.4 阶段 D: Accumulator 阶梯挂单（2 分钟，多单管理）
 
 | 项 | 内容 |
 |----|------|
-| **测试内容** | `kill -9` 后重启，验证从 persistence 恢复上次状态 |
-| **为什么** | v0.1.0 HIGH 4.5：崩溃后风控状态丢失，可能在不安全状态下重新交易。修复：`_load_recovery_state()` 从 DB 恢复状态。 |
-| **怎么测试** | (dry-run) 运行中 `kill -9`，然后重新启动，检查日志中 recovery 相关信息 |
-| **通过标准** | 重启日志包含 `recovery` 或 bot_state 从 DB 加载的记录 |
+| **测试内容** | 验证 Accumulator 策略的多档阶梯挂单：正确的 rung 数量、价格间距、订单大小，以及价格变动后的阶梯调整（取消旧单 + 放置新单） |
+| **为什么** | Accumulator 是核心策略。验证：(1) 5 档阶梯正确放置 (2) 每档价格间距 = rung_spacing_ticks * tick_size (3) 当 ref_price 变化时旧阶梯被取消、新阶梯被放置 (4) 订单数不超过 max_open_orders 上限 (5) reconcile 正确跟踪订单状态变化。v0.1.0 HIGH 4.2：cancel_all 空字符串无法撤单，修复后必须传入正确 pair。 |
+| **风控参数** | `max_order_size_notional: 2.0`，`max_open_orders: 5` |
+| **怎么测试** | |
+
+**配置调整**:
+```yaml
+risk:
+  max_order_size_notional: 2.0
+  max_position_notional: 10.0
+  max_open_orders: 5
+```
+
+```bash
+GATE_EXCHANGE__API_KEY=$KEY GATE_EXCHANGE__API_SECRET=$SECRET \
+  .venv/bin/python scripts/run.py \
+  --live --pair BTC_USDT \
+  --duration 120 --tick-interval 0.5 \
+  --config config/live.yaml \
+  --data-dir data/live_test \
+  2>&1 | tee /tmp/gate_4d.log
+```
+
+**运行中检查**:
+
+```bash
+# 每隔 10 秒抓一次快照，观察订单列表变化
+for i in $(seq 1 12); do
+  echo "=== Tick $i ==="
+  curl -s http://127.0.0.1:39120/api/snapshot | python3 -c "
+import sys, json
+s = json.load(sys.stdin)
+print(f'state={s[\"state\"]} open_orders={s[\"open_orders\"]}')
+for o in s.get('order_list', []):
+    print(f'  {o[\"side\"]} @ {o[\"price\"]} x{o[\"size\"]}')
+"
+  sleep 10
+done
+```
+
+**日志分析**:
+
+```bash
+# 统计阶梯放置情况
+grep "order_placed" /tmp/gate_4d.log | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+        print(f'{d[\"side\"]} @ {d[\"price\"]:.2f} x{d[\"size\"]}')
+    except: pass
+"
+
+# 检查每次阶梯调整是否先取消旧单
+grep -E "order_cancelled|all_cancelled|order_placed" /tmp/gate_4d.log | head -30
+```
+
+**通过标准**:
+- [ ] 至少 1 轮完整的阶梯放置（5 档买单）
+- [ ] 每档价格严格递减（rung_spacing_ticks=5 * tick_size=0.01 = 0.05）
+- [ ] 价格波动后旧阶梯被 cancel、新阶梯被 place（cancel 先于 place）
+- [ ] 任意时刻 open_orders ≤ max_open_orders (5)
+- [ ] 所有挂单价格在 ref_price ±20% 范围内
+- [ ] shutdown 后交易所无残留挂单
+- [ ] `all_cancelled` 的 pair 参数为 `BTC_USDT`（非空字符串）
+
+---
+
+### 4.5 阶段 E: 风控行为验证（5 分钟，模拟触发）
+
+| 项 | 内容 |
+|----|------|
+| **测试内容** | 验证三类风控触发和恢复：(1) 订单数上限 (2) 仓位上限 (3) 价格闪崩 cooldown |
+| **为什么** | v0.1.0 CRITICAL 3.2：余额空传入导致风控虚设。v0.1.0 CRITICAL 3.5：cooldown 永久死锁。v0.1.0 HIGH 4.6：闪崩阈值硬编码。修复后 (1) 余额按 base currency 拆分传入 (2) cooldown 到期自动恢复 (3) 阈值从配置读取。此项测试需要设置极低的风控参数来主动触发。 |
+| **风控参数** | 极低值以确保触发 |
+| **怎么测试** | |
+
+**配置调整**（故意设低以触发风控）:
+```yaml
+risk:
+  max_order_size_notional: 2.0
+  max_position_notional: 5.0     # 极低，容易触发
+  max_open_orders: 2             # 极低，容易触发
+  cooldown_fill_ms: 3000
+  flash_crash_threshold_pct: 1.0 # 极低，容易触发闪崩检测
+```
+
+**T4E.1 — 订单数上限触发**
+
+```bash
+# 设置 max_open_orders=1，Accumulator 尝试放置 5 档 → 第 2 档起应被拒绝
+```
+
+| 通过标准 | (1) 日志出现 `risk_halt` 或 order count 相关 warning (2) 实际挂单数 ≤ max_open_orders (3) 不会因此 crash |
+
+**T4E.2 — 价格尖峰 cooldown 恢复**
+
+```bash
+# 在真实行情中等待自然波动触发 spike，或通过观察日志确认
+grep -E "spike_detected|cooldown|COOLDOWN_PRICE_SPIKE" /tmp/gate_4e.log
+```
+
+| 通过标准 | (1) 若触发 spike_detected → state 变为 COOLDOWN_PRICE_SPIKE (2) cooldown 到期后 state 恢复 RUNNING（非永久卡住）(3) 状态转换走 `state_transition` 日志（非直接赋值） |
+
+**T4E.3 — 闪崩检测阈值配置化**
+
+| 通过标准 | 日志中 `flash_crash_threshold_pct` 的值与 `config/live.yaml` 一致（1.0），非硬编码 5.0 |
+
+---
+
+### 4.6 阶段 F: 持久化与状态恢复（跨进程）
+
+| 项 | 内容 |
+|----|------|
+| **测试内容** | 验证 (1) 运行中状态实时持久化 (2) 正常关机后状态正确保存 (3) 重新启动后状态恢复 (4) 异常 kill 后重启不丢失风控状态 |
+| **为什么** | v0.1.0 HIGH 4.3：`load_state()` 对未知状态值直接崩溃。v0.1.0 HIGH 4.5：风控状态纯内存、崩溃后丢失。修复：(1) load_state 容错降级 INIT (2) `_load_recovery_state()` 从 DB 恢复 cooldown/emergency 状态 (3) shutdown 持久化最终状态。 |
+| **怎么测试** | |
+
+**T4F.1 — 正常关机状态保存**
+
+```bash
+# 1. 运行 60 秒 dry-run
+.venv/bin/python scripts/run.py --pair BTC_USDT --duration 60 --data-dir data/live_test 2>&1
+
+# 2. 检查 bot_state 表
+sqlite3 data/live_test/gate_trade.db "SELECT * FROM bot_state"
+```
+
+| 通过标准 | bot_state 表包含 `SHUTDOWN` 状态 |
+
+**T4F.2 — 异常 kill 后重启恢复**
+
+```bash
+# 1. 启动 dry-run 后台运行
+.venv/bin/python scripts/run.py --pair BTC_USDT --duration 300 --data-dir data/live_test &
+PID=$!
+sleep 5
+
+# 2. 模拟崩溃
+kill -9 $PID
+sleep 2
+
+# 3. 重新启动
+.venv/bin/python scripts/run.py --pair BTC_USDT --duration 30 --data-dir data/live_test 2>&1 | grep -i "recovery\|load_state\|restored"
+
+# 4. 检查恢复的状态
+sqlite3 data/live_test/gate_trade.db "SELECT state, sub_state FROM bot_state"
+```
+
+| 通过标准 | (1) 重启后从 DB 读取了上次状态 (2) 若是 COOLDOWN/EMERGENCY 状态则保留不自动恢复交易 (3) 若是 INIT/IDLE/RUNNING 则正常启动 |
+
+**T4F.3 — orders 表持久化**
+
+```bash
+# 检查 orders 表在多次运行间的数据完整性
+sqlite3 data/live_test/gate_trade.db "SELECT COUNT(*), status FROM orders GROUP BY status"
+```
+
+| 通过标准 | orders 表保留历史订单记录，跨进程不丢失 |
+
+---
+
+### 4.7 阶段 G: 告警通道验证
+
+| 项 | 内容 |
+|----|------|
+| **测试内容** | 验证 AlertManager 在风控事件时能正确发送告警 |
+| **为什么** | v0.1.0 HIGH 4.9：alert webhook 接线错误，channel 未正确初始化。修复：(1) `_build_alert()` 检查 token/url 非空才注册 (2) WebhookChannel 已实现 (3) 改用 httpx 异步。 |
+| **怎么测试** | |
+
+**T4G.1 — Webhook 通道**
+
+```yaml
+# config/live.yaml 中配置测试 webhook（如 Slack/Discord 或 webhook.site）
+monitoring:
+  alert_webhook_url: "https://webhook.site/your-test-url"
+```
+
+```bash
+# 触发风控事件（如设置极低 max_open_orders），观察 webhook 是否收到 POST
+```
+
+| 通过标准 | (1) webhook 收到 JSON POST 请求 (2) JSON 包含 `level, subject, body` 字段 (3) 日志中 `alert_sent, channels=1` |
+
+**T4G.2 — 空 URL 不创建 Channel**
+
+| 通过标准 | 若 `alert_webhook_url` 为空，日志不出现 `alert_sent`（因为 _channels 列表为空），只出现 `alert_no_channels` |
+
+---
+
+### 4.8 阶段 H: 常规规模运行（30 分钟）
+
+| 项 | 内容 |
+|----|------|
+| **测试内容** | 以生产参数运行 30 分钟，验证长时间稳定性 |
+| **为什么** | 验证系统在接近生产环境配置下的长时间行为：内存稳定、DB 不膨胀、无累积错误。 |
+| **风控参数** | 恢复正常值 |
+| **怎么测试** | |
+
+```yaml
+risk:
+  max_order_size_notional: 10.0
+  max_position_notional: 100.0
+  max_open_orders: 10
+  flash_crash_threshold_pct: 5.0
+```
+
+```bash
+GATE_EXCHANGE__API_KEY=$KEY GATE_EXCHANGE__API_SECRET=$SECRET \
+  .venv/bin/python scripts/run.py \
+  --live --pair BTC_USDT \
+  --duration 1800 --tick-interval 0.5 \
+  --config config/live.yaml \
+  --data-dir data/live_test \
+  2>&1 | tee /tmp/gate_4h.log
+```
+
+**每 5 分钟检查**:
+
+```bash
+# 内存使用
+ps aux | grep run.py | awk '{print "RSS:", $6/1024, "MB"}'
+
+# 订单统计
+grep -c "order_placed" /tmp/gate_4h.log
+grep -c "order_cancelled" /tmp/gate_4h.log
+
+# 错误统计
+grep -c '"level": "error"' /tmp/gate_4h.log
+grep -c '"level": "warning"' /tmp/gate_4h.log
+
+# 状态分布
+grep "state_transition" /tmp/gate_4h.log | tail -20
+```
+
+**通过标准**:
+- [ ] 运行满 30 分钟无 crash
+- [ ] 内存使用稳定（波动 < 20%）
+- [ ] error 日志数 = 0
+- [ ] warning 日志仅为 spike_detected / rate_limit_skip（预期行为）
+- [ ] 风控无假阳性 halt
+- [ ] 每轮 cooldown 在 5s 内恢复
+- [ ] shutdown 后交易所无残留
+- [ ] DB 文件大小合理（< 50MB）
+
+---
+
+### 4.9 阶段 I: 异常场景（逐个执行，谨慎操作）
+
+> **警告**: 以下测试会主动引入故障，每次只执行一个，确认恢复后再执行下一个。
+
+**T4I.1 — WS 断线重连**
+
+| 测试内容 | 阻断到 ws.gateio.ws 的连接，观察重连 |
+|----------|--------------------------------------|
+| 为什么 | 生产环境中 WS 断线是最常见的故障。v0.1.0 FATAL 2.3：ping loop 从未启动导致连接静默断开。修复后后台 reconnect task + ping loop + 自动 resubscribe。 |
+| 怎么测试 | `sudo iptables -A OUTPUT -d $(dig +short ws.gateio.ws) -j DROP` 阻断 30s 后 `iptables -D ...` 恢复 |
+| 通过标准 | RECONNECT 状态 → 自动重连 → 恢复 RUNNING → 行情数据恢复 → 策略继续下单 |
+
+**T4I.2 — API 限频降级**
+
+| 测试内容 | 设置 burst=1, rate=0.5 极低限速，观察 order engine 行为 |
+|----------|---------------------------------------------------------|
+| 为什么 | v0.2.0 改进：令牌桶超时返回 False 而非 raise，order engine 记录 warning 跳过 |
+| 怎么测试 | 修改 rate_limit 配置为 burst=1, rate=0.5, max_wait_sec=1 |
+| 通过标准 | `rate_limit_skip` warning 日志 → 不 crash → 后续 tick 正常下单 |
+
+**T4I.3 — 交易所 429 限频**
+
+| 测试内容 | 观察真实 429 响应的处理 |
+|----------|------------------------|
+| 为什么 | Gate.io spot API 限制 200 req/10s，高负载下可能触发 |
+| 通过标准 | `rate_limit_exceeded` 日志 → 不 crash → 自动退避 |
+
+**T4I.4 — 手动中断测试**
+
+| 测试内容 | 运行中按 Ctrl+C，验证优雅关机 + 撤单 |
+|----------|-------------------------------------|
+| 为什么 | 运维人员需要能安全停止 bot。 |
+| 怎么测试 | 启动 3 分钟后 `kill <PID>`（SIGTERM） |
+| 通过标准 | shutdown 流程完整执行 → 所有挂单被取消 → DB 关闭 |
+
+---
+
+### 4.10 阶段 J: 多交易对扩展（可选）
+
+| 项 | 内容 |
+|----|------|
+| **测试内容** | 在 BTC_USDT 稳定运行后，添加第二个交易对（如 ETH_USDT） |
+| **为什么** | 验证多交易对场景：余额拆分、独立风控、策略隔离。 |
+| **注意** | 当前 bot 实例仅支持单交易对。多交易对需要运行多个 bot 实例，共享同一个 persistence。 |
+
+---
+
+## Phase 5: 异常场景补充测试
+
+### T5.1 — 数据库写入失败容错
+
+| 项 | 内容 |
+|----|------|
+| **测试内容** | DB 只读时主循环不 crash |
+| **为什么** | DB 写入失败不应导致交易循环崩溃。 |
+| **怎么测试** | (dry-run) `chmod 444 data/gate_trade.db` 后运行 |
+| **通过标准** | 日志 error 但主循环继续运行，tick 不中断 |
+
+### T5.2 — 日志脱敏验证
+
+| 项 | 内容 |
+|----|------|
+| **测试内容** | 确认 API 密钥不出现在任何日志中 |
+| **为什么** | v0.2.0 改进：`_handle_api_error` 中 `exc.body` 截断为 200 字符，不输出完整响应体。 |
+| **怎么测试** | `grep -i "$GATE_EXCHANGE__API_KEY" /tmp/gate_*.log` 应无匹配 |
+| **通过标准** | 所有日志文件中无 API key/secret 出现 |
 
 ---
 
@@ -369,21 +819,22 @@
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-阶段:     Phase ___ (___)
-时间:     2026-05-05 ___:___
-运行时长: ___s
+阶段:     4___ (_________)
+日期:     2026-05-05 ___:___
+运行时长:  ___s   交易对: _______
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-tick 总数:      ___
-下单总数:       ___
-成交总数:       ___
-撤单总数:       ___
-价格尖峰次数:    ___
-cooldown 次数:  ___
-风控 halt 次数:  ___
-WS 重连次数:     ___
-error 日志数:    ___
-warning 日志数:  ___
-最终状态:       ___
+总 tick:       ___    下单总数: ___
+成交总数:      ___    撤单总数: ___
+open_orders 峰值: ___    max orders 实际上限: ___
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+价格尖峰:      ___    cooldown 触发: ___
+cooldown 恢复:  ___    平均恢复时间: ___s
+风控 halt:      ___    halt 原因: _________
+WS 重连:       ___    429 次数: ___
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+error:         ___    warning: ___
+内存峰值:      ___MB  DB 大小: ___KB
+最终状态:      ___    退出码: ___
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 通过/失败:      [ ]
 备注:
@@ -392,42 +843,73 @@ warning 日志数:  ___
 
 ---
 
-## 应急终止
+## 应急操作手册
 
-遇到意外行为时立即执行：
+### 立即停止
 
 ```bash
-# 优雅停止（触发 shutdown 撤单）
+# 1. 找到进程
+ps aux | grep "scripts/run.py"
+
+# 2. 优雅停止（触发 shutdown → 撤单 → 保存状态 → 关闭 DB）
 kill <PID>
 
-# 强制停止
+# 3. 等待 10 秒，如果仍未退出
+sleep 10
 kill -9 <PID>
+```
 
-# 手动撤掉交易所所有挂单
+### 紧急撤单
+
+```bash
+# 方式 1: 通过 Gate.io Web → Orders → Cancel All（最快最可靠）
+
+# 方式 2: 通过 API
+PAIR="BTC_USDT"
 curl -X DELETE \
-  "https://api.gateio.ws/api/v4/spot/orders?currency_pair=BTC_USDT" \
+  "https://api.gateio.ws/api/v4/spot/orders?currency_pair=$PAIR" \
   -H "KEY: $GATE_EXCHANGE__API_KEY" \
-  -H "SIGN: $(...)"
-# 或直接登录 Gate.io → Orders → Cancel All
+  -H "SIGN: $(echo -n "DELETE\n/api/v4/spot/orders\ncurrency_pair=$PAIR\n$(date +%s)" | openssl dgst -sha512 -hmac "$GATE_EXCHANGE__API_SECRET" | cut -d' ' -f2)"
+
+# 方式 3: 检查残留
+curl -s -H "KEY: $GATE_EXCHANGE__API_KEY" \
+  "https://api.gateio.ws/api/v4/spot/open_orders?currency_pair=$PAIR"
+```
+
+### 恢复正常交易
+
+```bash
+# 确认交易所无残留挂单后，重新启动
+GATE_EXCHANGE__API_KEY=$KEY GATE_EXCHANGE__API_SECRET=$SECRET \
+  .venv/bin/python scripts/run.py --live --pair BTC_USDT ...
 ```
 
 ---
 
 ## 通过标准汇总
 
-| 阶段 | 测试数 | 通过条件 |
-|------|--------|---------|
-| Phase 1 | 4 | 4/4 全部 |
-| Phase 2 | 7 | 7/7 全部 |
-| Phase 3 | 15 | 15/15 全部 |
-| Phase 4A | 1 | preflight 四步全过 |
-| Phase 4B | 1 | 下单+撤单干净 |
-| Phase 4C | 1 | 10min 无异常 |
-| Phase 5 | 4 | 按需执行 |
+| 阶段 | 测试项 | 通过条件 | 依赖 |
+|------|--------|---------|------|
+| Phase 1 | 4 | 4/4 全部 | - |
+| Phase 2 | 7 | 7/7 全部 | Phase 1 |
+| Phase 3 | 15 | 15/15 全部 | Phase 1 |
+| **4A** | 3 | API 拒绝 + 格式 + 连通 | - |
+| **4B** | 1 | 7 条关键日志全过，无下单 | 4A |
+| **4C** | 1 | 下单+撤单干净，DB 记录一致 | 4B |
+| **4D** | 1 | 阶梯正确，cancel_all pair 非空 | 4C |
+| **4E** | 3 | 订单上限 + cooldown 恢复 + 阈值 | 4D |
+| **4F** | 3 | 状态持久化 + crash 恢复 + orders | 4B |
+| **4G** | 2 | webhook POST + 空 URL 不注册 | 4B |
+| **4H** | 1 | 30min 无异常，内存稳定 | 4C-4G |
+| **4I** | 4 | WS / 限频 / 429 / Ctrl+C | 4H |
+| Phase 5 | 2 | DB 容错 + 日志脱敏 | - |
 
-**Phases 1-3 全部通过后方可进入 Phase 4。Phase 4A→4B→4C 必须顺序通过，不可跳过。**
+**Phases 1-3 全部通过后方可进入 Phase 4。**
+**Phase 4 阶段 A→B→C→D→E→F→G→H→I 必须顺序通过，不可跳过。**
+**每个阶段的"通过标准"全部打勾后才能进入下一个阶段。**
 
 ---
 
 > 测试方案基于 `audit/AUDIT_COMPREHENSIVE.md` 的 27 个问题制定。
 > 每个测试用例明确了测试内容、测试原因（映射到具体审计问题）、测试方法和通过标准。
+> Phase 4 参考了 `docs/IMPROVEMENT_PLAN.md` 中 Phase 5 灰度发布流程。
