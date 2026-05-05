@@ -1,0 +1,41 @@
+# Gate Trade Bot — systemd user unit
+# Install: mkdir -p ~/.config/systemd/user && cp this file there
+# Enable:  systemctl --user daemon-reload && systemctl --user enable --now gate-trade
+#
+# Logs:    journalctl --user -u gate-trade -f
+
+[Unit]
+Description=Gate Trade Spot Accumulation Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gate-trade
+Environment=PYTHONUNBUFFERED=1
+Environment=GATE_CONFIG=%h/gate-trade/config/default.yaml
+ExecStart=%h/gate-trade/.venv/bin/python -m gate_trade.main
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gate-trade
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/gate-trade/data
+ReadOnlyPaths=%h/gate-trade/config
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=200%
+
+[Install]
+WantedBy=default.target
