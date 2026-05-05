@@ -17,6 +17,8 @@ dependencies = [
     "structlog>=24.0",
     "pyyaml>=6.0",
     "orjson>=3.9",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
 ]
 
 [project.optional-dependencies]
