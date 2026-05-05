@@ -19,6 +19,7 @@ import structlog
 from gate_trade.markout.recorder import MarkoutRecorder
 from gate_trade.markout.response import ToxicResponse
 from gate_trade.markout.toxic import ToxicDetector
+from gate_trade.persistence.event_log import BotEventLogger, BotEventType
 from gate_trade.state.cooldown import CooldownManager
 from gate_trade.types import BotState, RunSubState
 
@@ -58,6 +59,8 @@ class Bot:
         toxic: ToxicDetector | None = None,
         toxic_response: ToxicResponse | None = None,
         alert: Any = None,        # AlertManager protocol
+        persistence: Any = None,  # Persistence protocol
+        pair: str = "",
         dry_run: bool = True,
         tick_interval: float = 0.5,
     ) -> None:
@@ -75,6 +78,10 @@ class Bot:
         self._dry_run = dry_run
         self._tick_interval = tick_interval
 
+        self._events = BotEventLogger(pair=pair)
+        if persistence is not None:
+            self._events.bind(persistence)
+
         self._running = False
         self._tick_count = 0
         self._start_time = 0.0
@@ -90,6 +97,10 @@ class Bot:
         if self._start_time == 0.0:
             return 0.0
         return time.monotonic() - self._start_time
+
+    @property
+    def events(self) -> BotEventLogger:
+        return self._events
 
     @property
     def running(self) -> bool:
@@ -169,6 +180,9 @@ class Bot:
             self._sm.start_cooldown_price_spike(
                 self._ref.spike_cooldown_remaining_ms
             )
+            self._events.record(BotEventType.SPIKE,
+                              mid=round(mid, 2),
+                              cooldown_ms=self._ref.spike_cooldown_remaining_ms)
 
         # 5. Risk evaluation
         self._risk.evaluate(
@@ -179,21 +193,26 @@ class Bot:
         if self._risk.halted:
             logger.warning("bot_halted_by_risk")
             self._sm.transition(BotState.EMERGENCY)
+            self._events.record(BotEventType.RISK, reason=self._risk.halt_reason,
+                              mid=round(mid, 2), state="EMERGENCY")
             await self._alert_warn("Bot halted by risk manager")
             return
 
         # 6. Update strategies
+        strat_states: list[dict[str, Any]] = []
         for strat in self._strategies:
             if strat.active:
                 strat.update_market(ref, spike_active=self._ref.spike_protection_active)
+            strat_states.append({"name": strat.name, "active": strat.active})
 
         # 7. Check if we can place
         if not self._sm.can_place():
+            self._record_tick(mid, ref, strat_states)
             return
         if not self._cooldown.can_place():
-            # Compliance depth still required even during cooldown
             if self._cooldown.compliance_depth_required():
                 await self._place_compliance_orders()
+            self._record_tick(mid, ref, strat_states)
             return
 
         # 8. Place/refresh orders
@@ -208,12 +227,17 @@ class Bot:
             ratio = self._toxic.toxic_ratio
             level = self._tox_resp.evaluate(ratio, self._toxic.total_count)
             if level != self._tox_resp.level:
+                self._events.record(BotEventType.TOXIC,
+                                  level=level.value, ratio=round(ratio, 4))
                 await self._alert_info(
                     f"Toxic level changed: {level.value} (ratio={ratio:.1%})"
                 )
 
         # 11. State machine sub-state management
         self._manage_sub_state()
+
+        # Record tick summary
+        self._record_tick(mid, ref, strat_states)
 
     # ── Order management ────────────────────────────────────────
 
@@ -237,6 +261,9 @@ class Bot:
                 logger.info("dry_run_would_place",
                            strategy=strat.name, side=req.side.value,
                            price=req.price, size=req.size)
+                self._events.record(BotEventType.ORDER_PLACE,
+                                  strategy=strat.name, side=req.side.value,
+                                  price=req.price, size=req.size, dry_run=True)
             self._sm.set_sub_state(RunSubState.WAITING)
             return
 
@@ -244,8 +271,13 @@ class Bot:
         for _strat, req in desired:
             try:
                 await self._oe.place(req)
+                self._events.record(BotEventType.ORDER_PLACE,
+                                  side=req.side.value, price=req.price,
+                                  size=req.size, dry_run=False)
             except Exception:
                 logger.warning("place_failed", price=req.price, side=req.side.value)
+                self._events.record(BotEventType.ERROR, msg="place_failed",
+                                  price=req.price, side=req.side.value)
 
         self._sm.set_sub_state(RunSubState.WAITING)
 
@@ -270,6 +302,18 @@ class Bot:
         orders = self._oe.open_orders()
         return [o.price for o in orders if o.side.value == side]
 
+    def _record_tick(
+        self, mid: float, ref: float, strat_states: list[dict[str, Any]],
+    ) -> None:
+        self._events.record(BotEventType.TICK,
+                          state=self._sm.state.value,
+                          mid=round(mid, 2),
+                          ref_price=round(ref, 2),
+                          spread_bps=round(self._md.spread_bps(), 1),
+                          toxic_level=self._tox_resp.level.value,
+                          strategies=strat_states,
+                          open_orders=len(self._oe.open_orders()))
+
     def _manage_sub_state(self) -> None:
         """Determine RUNNING sub-state based on order book conditions."""
         if not self._oe.open_orders():
@@ -280,6 +324,8 @@ class Bot:
     async def _shutdown(self) -> None:
         logger.info("bot_shutting_down", tick_count=self._tick_count,
                     uptime=round(self.uptime_seconds, 1))
+        self._events.record(BotEventType.SHUTDOWN, tick_count=self._tick_count,
+                          uptime=round(self.uptime_seconds, 1))
         self._sm.transition(BotState.SHUTDOWN)
         if not self._dry_run:
             try:

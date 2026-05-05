@@ -25,7 +25,7 @@ class TestDashboard:
 
     def test_dashboard_contains_auto_refresh(self):
         resp = client.get("/")
-        assert "setInterval(refresh, 5000)" in resp.text
+        assert "setInterval(pollSnapshot, 3000)" in resp.text
 
 
 class TestStatusEndpoint:

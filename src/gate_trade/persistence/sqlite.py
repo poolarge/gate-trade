@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -57,6 +59,16 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_fills_order_id ON fills(order_id);
 CREATE INDEX IF NOT EXISTS idx_fills_pair ON fills(pair);
 CREATE INDEX IF NOT EXISTS idx_markouts_pair ON markouts(pair);
+
+CREATE TABLE IF NOT EXISTS event_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type    TEXT NOT NULL,
+    event_data    TEXT NOT NULL DEFAULT '{}',
+    created_at_ms INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_type ON event_log(event_type);
+CREATE INDEX IF NOT EXISTS idx_event_created ON event_log(created_at_ms);
 """
 
 
@@ -196,6 +208,44 @@ class SqlitePersistence(Persistence):
             (fill_id, pair, fill_price, ref_5s, ref_30s, ref_5min),
         )
         self._db.commit()
+
+    # ── Events ──────────────────────────────────────────────────
+
+    def save_event(self, event: Any) -> None:  # BotEvent from event_log module
+        import json as _json
+        self._db.execute(
+            "INSERT INTO event_log (event_type, event_data) VALUES (?, ?)",
+            (event.type.value if hasattr(event, 'type') else str(event.type),
+             _json.dumps(event.to_dict() if hasattr(event, 'to_dict') else {})),
+        )
+        self._db.commit()
+
+    def load_events(
+        self, event_type: str | None = None, limit: int = 200, since_ms: int = 0,
+    ) -> list[dict[str, object]]:
+        sql = "SELECT event_type, event_data, created_at_ms FROM event_log"
+        params: list[Any] = []
+        conditions: list[str] = []
+        if event_type:
+            conditions.append("event_type = ?")
+            params.append(event_type)
+        if since_ms > 0:
+            conditions.append("created_at_ms > ?")
+            params.append(since_ms)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._db.execute(sql, params).fetchall()
+        result: list[dict[str, object]] = []
+        for r in reversed(rows):
+            event_data: dict[str, Any] = {}
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                event_data = json.loads(r[1]) if r[1] else {}
+            result.append({
+                "event_type": r[0], "data": event_data, "created_at_ms": r[2],
+            })
+        return result
 
     # ── Maintenance ──────────────────────────────────────────────
 

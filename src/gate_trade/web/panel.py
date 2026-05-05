@@ -1,22 +1,54 @@
-"""Web Panel — FastAPI monitoring dashboard on port 39120.
+"""Web Panel — real-time operations dashboard on port 39120.
 
-Phase 8.1: Single-page dashboard with bot status, fills, orders, and
-daily summary. Auto-refreshing via polling.
+Phase 8.1+: Single-page dashboard with live bot state, order book,
+fill stream, event log, and SSE-based real-time updates.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import sqlite3
+from collections.abc import AsyncGenerator
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-app = FastAPI(title="Gate Trade Panel", version="0.1.0")
+app = FastAPI(title="Gate Trade Panel", version="0.2.0")
 
 DEFAULT_DB = "data/gate_trade.db"
+
+# In-process references set by the launcher when running embedded
+_bot: Any = None
+_event_queue: asyncio.Queue[dict[str, Any]] | None = None
+_subscribers: list[asyncio.Queue[dict[str, Any]]] = []
+
+
+def bind_bot(bot: Any) -> None:
+    """Attach the running Bot instance for live data access."""
+    global _bot, _event_queue
+    _bot = bot
+    _event_queue = asyncio.Queue(maxsize=512)
+    if hasattr(bot, 'events') and hasattr(bot.events, '_on_record'):
+        bot.events._on_record = lambda evt: _broadcast(evt.to_dict())
+
+
+def _broadcast(event: dict[str, Any]) -> None:
+    if _event_queue is not None:
+        with contextlib.suppress(asyncio.QueueFull):
+            _event_queue.put_nowait(event)
+    dead: list[int] = []
+    for i, q in enumerate(_subscribers):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            dead.append(i)
+    for i in reversed(dead):
+        _subscribers.pop(i)
 
 
 def _open_db(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
@@ -28,7 +60,116 @@ def _open_db(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     return con
 
 
-# ── API endpoints ──────────────────────────────────────────────────
+# ── API: Events stream (SSE) ──────────────────────────────────────
+
+
+@app.get("/api/stream")
+async def api_stream(request: Request) -> StreamingResponse:
+    """Server-Sent Events endpoint for real-time bot updates."""
+
+    async def _generate() -> AsyncGenerator[str, None]:
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
+        _subscribers.append(q)
+        try:
+            # Send initial event
+            yield "data: {\"type\": \"connected\"}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=15)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            if q in _subscribers:
+                _subscribers.remove(q)
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── API: Events history ───────────────────────────────────────────
+
+
+@app.get("/api/events")
+async def api_events(
+    limit: int = Query(default=100, le=500),
+    since: float | None = None,
+) -> JSONResponse:
+    """Return recent bot events from the in-memory buffer or database."""
+    events: list[dict[str, Any]] = []
+    if _bot is not None and hasattr(_bot, 'events'):
+        events = _bot.events.recent(limit=limit, since=since)
+    if not events:
+        # Fall back to database
+        try:
+            con = _open_db(DEFAULT_DB)
+            rows = con.execute(
+                "SELECT event_type, event_data, created_at_ms FROM event_log "
+                "ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            for r in reversed(rows):
+                data: dict[str, Any] = {}
+                with contextlib.suppress(json.JSONDecodeError, TypeError):
+                    data = json.loads(r["event_data"]) if r["event_data"] else {}
+                events.append({
+                    "type": r["event_type"], "ts": r["created_at_ms"] / 1000.0, **data,
+                })
+        except FileNotFoundError:
+            pass
+    return JSONResponse(events)
+
+
+# ── API: Live snapshot ─────────────────────────────────────────────
+
+
+@app.get("/api/snapshot")
+async def api_snapshot() -> JSONResponse:
+    """Return a comprehensive snapshot of current bot state."""
+    if _bot is None:
+        return JSONResponse({"error": "bot not connected"}, status_code=503)
+
+    bot = _bot
+    md = bot._md
+    sm = bot._sm
+    tox = bot._tox_resp
+
+    orders = bot._oe.open_orders()
+    order_list: list[dict[str, Any]] = []
+    for o in orders:
+        order_list.append({
+            "id": o.order_id, "side": o.side.value,
+            "price": o.price, "size": o.size, "filled": o.filled_size,
+        })
+
+    strategies: list[dict[str, Any]] = []
+    for s in bot._strategies:
+        strategies.append({
+            "name": s.name, "active": s.active,
+        })
+
+    return JSONResponse({
+        "tick": bot.tick_count,
+        "uptime": round(bot.uptime_seconds, 1),
+        "state": sm.state.value,
+        "sub_state": sm.sub_state.value if sm.sub_state else None,
+        "toxic_level": tox.level.value,
+        "dry_run": bot._dry_run,
+        "mid": round(md.mid_price(), 2),
+        "best_bid": round(md.best_bid(), 2),
+        "best_ask": round(md.best_ask(), 2),
+        "spread_bps": round(md.spread_bps(), 1),
+        "open_orders": len(orders),
+        "order_list": order_list[:20],
+        "strategies": strategies,
+        "can_place": sm.can_place(),
+    })
+
+
+# ── API: Health / Status / Fills / Summary ────────────────────────
 
 
 @app.get("/api/health")
@@ -38,51 +179,34 @@ async def api_health() -> dict[str, str]:
 
 @app.get("/api/status")
 async def api_status(db: str = Query(default=DEFAULT_DB)) -> JSONResponse:
+    if _bot is not None:
+        return await api_snapshot()
     try:
         con = _open_db(db)
         state = con.execute(
-            "SELECT key, value FROM state WHERE key IN ('bot_state', 'toxic_level')"
-        ).fetchall()
-        state_map = {r["key"]: r["value"] for r in state}
-
-        fill_count = con.execute("SELECT COUNT(*) AS n FROM fills").fetchone()["n"]
-        order_count = con.execute(
-            "SELECT COUNT(*) AS n FROM orders WHERE status='open'"
-        ).fetchone()["n"]
-
-        return JSONResponse({
-            "bot_state": state_map.get("bot_state", "UNKNOWN"),
-            "toxic_level": state_map.get("toxic_level", "NORMAL"),
-            "total_fills": fill_count,
-            "open_orders": order_count,
-        })
+            "SELECT event_data FROM event_log WHERE event_type='tick' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if state:
+            data = json.loads(state["event_data"]) if state["event_data"] else {}
+            return JSONResponse({"bot_state": data.get("state", "UNKNOWN"),
+                                 "toxic_level": data.get("toxic_level", "NORMAL")})
+        return JSONResponse({"bot_state": "UNKNOWN", "toxic_level": "NORMAL"})
     except FileNotFoundError:
         return JSONResponse({"error": "database not found"}, status_code=503)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/api/fills")
 async def api_fills(
     db: str = Query(default=DEFAULT_DB),
     limit: int = Query(default=50, le=200),
-    since: str | None = None,
 ) -> JSONResponse:
     try:
         con = _open_db(db)
-        if since:
-            rows = con.execute(
-                "SELECT side, price, filled_size, created_at FROM fills"
-                " WHERE datetime(created_at, 'unixepoch') > ?"
-                " ORDER BY created_at DESC LIMIT ?",
-                (since, limit),
-            ).fetchall()
-        else:
-            rows = con.execute(
-                "SELECT side, price, filled_size, created_at FROM fills"
-                " ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+        rows = con.execute(
+            "SELECT side, price, filled_size, created_at FROM fills "
+            "ORDER BY created_at DESC LIMIT ?", (limit,),
+        ).fetchall()
         fills: list[dict[str, Any]] = []
         for r in rows:
             fills.append({
@@ -94,20 +218,16 @@ async def api_fills(
         return JSONResponse(fills)
     except FileNotFoundError:
         return JSONResponse({"error": "database not found"}, status_code=503)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/api/summary")
 async def api_summary(
     db: str = Query(default=DEFAULT_DB),
-    day: str | None = None,
 ) -> JSONResponse:
     try:
         con = _open_db(db)
-        target_day = day or date.today().isoformat()
+        target_day = date.today().isoformat()
         where = f"date(created_at, 'unixepoch') = '{target_day}'"
-
         row = con.execute(
             "SELECT"
             "  COALESCE(SUM(CASE WHEN side='buy' THEN price*filled_size ELSE 0 END),0) AS buy_volume,"
@@ -117,55 +237,87 @@ async def api_summary(
             "  COUNT(*) AS fill_count"
             " FROM fills WHERE " + where
         ).fetchone()
-
-        return JSONResponse(dict(row))
+        row_d = dict(row)
+        row_d["buy_volume"] = row_d.get("buy_volume", 0)
+        row_d["sell_volume"] = row_d.get("sell_volume", 0)
+        row_d["total_bought"] = row_d.get("total_bought", 0)
+        row_d["total_sold"] = row_d.get("total_sold", 0)
+        row_d["fill_count"] = row_d.get("fill_count", 0)
+        return JSONResponse(row_d)
     except FileNotFoundError:
         return JSONResponse({"error": "database not found"}, status_code=503)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 # ── Dashboard HTML ─────────────────────────────────────────────────
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Gate Trade Panel</title>
+<title>Gate Trade — Operations Panel</title>
 <style>
   :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9;
           --green: #3fb950; --red: #f85149; --yellow: #d2991d; --blue: #58a6ff; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace;
-         background: var(--bg); color: var(--text); padding: 24px; }
-  h1 { font-size: 20px; margin-bottom: 20px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+         background: var(--bg); color: var(--text); padding: 20px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { font-size: 12px; color: #484f58; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-          padding: 16px; }
-  .card h2 { font-size: 12px; text-transform: uppercase; color: #8b949e; margin-bottom: 8px; }
-  .card .value { font-size: 24px; font-weight: 600; }
-  .green { color: var(--green); } .red { color: var(--red); } .yellow { color: var(--yellow); }
-  table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
-  th { color: #8b949e; font-weight: 500; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-  .badge-running { background: #1b3a1b; color: var(--green); }
-  .badge-halt { background: #3a1b1b; color: var(--red); }
-  .badge-elevated { background: #3a2e1b; color: var(--yellow); }
-  .badge-dormant { background: #3a1b2e; color: #d27bca; }
-  .badge-normal { background: #1b2a3a; color: var(--blue); }
-  .refreshed { font-size: 11px; color: #484f58; margin-top: 24px; }
-  .section-title { font-size: 16px; margin: 24px 0 12px; color: #8b949e; }
+          padding: 14px; }
+  .card h2 { font-size: 11px; text-transform: uppercase; color: #8b949e; margin-bottom: 6px; }
+  .card .value { font-size: 22px; font-weight: 600; }
+  .green { color: var(--green); } .red { color: var(--red); }
+  .yellow { color: var(--yellow); } .blue { color: var(--blue); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+           margin-top: 16px; }
+  .panel-header { padding: 10px 14px; border-bottom: 1px solid var(--border);
+                  font-size: 12px; color: #8b949e; text-transform: uppercase; }
+  .panel-body { padding: 10px 14px; max-height: 320px; overflow-y: auto; }
+  .event-row { display: flex; gap: 10px; padding: 3px 0; font-size: 12px;
+               border-bottom: 1px solid rgba(48,54,61,0.5); align-items: center; }
+  .event-time { color: #484f58; min-width: 65px; font-size: 11px; }
+  .event-tag { padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600;
+               min-width: 56px; text-align: center; white-space: nowrap; }
+  .tag-tick { background: #1b2a3a; color: var(--blue); }
+  .tag-order { background: #1b3a2e; color: var(--green); }
+  .tag-risk { background: #3a1b1b; color: var(--red); }
+  .tag-toxic { background: #3a2e1b; color: var(--yellow); }
+  .tag-spike { background: #3a1b2e; color: #d27bca; }
+  .tag-shutdown { background: #1b1b2a; color: #8b949e; }
+  .event-detail { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .order-row { display: flex; gap: 10px; padding: 2px 0; font-size: 12px; }
+  .connection-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                    margin-right: 6px; }
+  .dot-live { background: var(--green); }
+  .dot-dead { background: var(--red); }
+  .sparkline { font-family: monospace; font-size: 10px; color: var(--blue); }
 </style>
 </head>
 <body>
 <h1>Gate Trade Panel</h1>
+<div class="subtitle">
+  <span class="connection-dot" id="conn-dot"></span>
+  <span id="conn-status">Connecting...</span>
+  &nbsp;|&nbsp; Last update: <span id="last-update">--</span>
+</div>
 
 <div class="grid">
   <div class="card">
     <h2>Bot State</h2>
     <div class="value" id="bot-state">--</div>
+  </div>
+  <div class="card">
+    <h2>Mid Price</h2>
+    <div class="value" id="mid-price">--</div>
+  </div>
+  <div class="card">
+    <h2>Spread</h2>
+    <div class="value" id="spread">--</div>
   </div>
   <div class="card">
     <h2>Toxic Level</h2>
@@ -176,99 +328,143 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="value" id="open-orders">--</div>
   </div>
   <div class="card">
-    <h2>Total Fills</h2>
-    <div class="value" id="total-fills">--</div>
+    <h2>Tick / Uptime</h2>
+    <div class="value" id="tick-uptime" style="font-size: 16px;">--</div>
   </div>
 </div>
 
-<div class="section-title">Today's Summary</div>
-<div class="grid" style="margin-bottom: 16px;">
-  <div class="card">
-    <h2>Fill Count</h2>
-    <div class="value" id="sum-fills">--</div>
+<div class="grid-2">
+  <div class="panel">
+    <div class="panel-header">Active Orders</div>
+    <div class="panel-body" id="orders-body">
+      <div style="color:#484f58;font-size:12px;">No active orders</div>
+    </div>
   </div>
-  <div class="card">
-    <h2>Buy Volume</h2>
-    <div class="value" id="sum-buy">--</div>
-  </div>
-  <div class="card">
-    <h2>Sell Volume</h2>
-    <div class="value" id="sum-sell">--</div>
-  </div>
-  <div class="card">
-    <h2>Net</h2>
-    <div class="value" id="sum-net">--</div>
+  <div class="panel">
+    <div class="panel-header">Strategies</div>
+    <div class="panel-body" id="strategies-body">
+      <div style="color:#484f58;font-size:12px;">--</div>
+    </div>
   </div>
 </div>
 
-<div class="section-title">Recent Fills</div>
-<table>
-  <thead><tr><th>Time</th><th>Side</th><th>Size</th><th>Price</th></tr></thead>
-  <tbody id="fills-body"><tr><td colspan="4">Loading...</td></tr></tbody>
-</table>
-
-<p class="refreshed" id="refreshed">Last update: --</p>
+<div class="panel">
+  <div class="panel-header">Event Stream (Live)</div>
+  <div class="panel-body" id="events-body" style="max-height: 400px;">
+    <div style="color:#484f58;font-size:12px;">Waiting for events...</div>
+  </div>
+</div>
 
 <script>
-const API = '/api';
-async function refresh() {
-  try {
-    const [status, summary, fills] = await Promise.all([
-      fetch(API + '/status').then(r => r.json()),
-      fetch(API + '/summary').then(r => r.json()),
-      fetch(API + '/fills?limit=20').then(r => r.json()),
-    ]);
+const MAX_EVENTS = 200;
+let events = [];
+let eventSource = null;
 
-    // Status cards
-    const state = status.bot_state || 'UNKNOWN';
-    const el = document.getElementById('bot-state');
-    el.textContent = state;
-    el.className = 'value badge ' + (
-      state.includes('COOLDOWN') || state === 'EMERGENCY' ? 'badge-elevated' :
-      state === 'RUNNING' ? 'badge-running' :
-      state === 'HALT' ? 'badge-halt' : 'badge-normal');
-
-    const tl = document.getElementById('toxic-level');
-    const tlv = status.toxic_level || 'NORMAL';
-    tl.textContent = tlv;
-    tl.className = 'value badge ' + (
-      tlv === 'HALT' ? 'badge-halt' : tlv === 'DORMANT' ? 'badge-dormant' :
-      tlv === 'ELEVATED' ? 'badge-elevated' : 'badge-normal');
-
-    document.getElementById('open-orders').textContent = status.open_orders ?? '--';
-    document.getElementById('total-fills').textContent = status.total_fills ?? '--';
-
-    // Summary
-    document.getElementById('sum-fills').textContent = summary.fill_count ?? '--';
-    document.getElementById('sum-buy').textContent = '$' + Number(summary.buy_volume || 0).toFixed(2);
-    document.getElementById('sum-sell').textContent = '$' + Number(summary.sell_volume || 0).toFixed(2);
-    const net = Number(summary.sell_volume || 0) - Number(summary.buy_volume || 0);
-    const netEl = document.getElementById('sum-net');
-    netEl.textContent = '$' + net.toFixed(2);
-    netEl.className = 'value ' + (net >= 0 ? 'green' : 'red');
-
-    // Fills table
-    const tbody = document.getElementById('fills-body');
-    if (Array.isArray(fills) && fills.length) {
-      tbody.innerHTML = fills.map(f => {
-        const cls = f.side === 'buy' ? 'green' : 'red';
-        return '<tr><td>' + f.time.slice(11,19) + '</td>' +
-               '<td class="' + cls + '">' + f.side.toUpperCase() + '</td>' +
-               '<td>' + Number(f.filled_size).toFixed(6) + '</td>' +
-               '<td>$' + Number(f.price).toFixed(2) + '</td></tr>';
-      }).join('');
-    } else {
-      tbody.innerHTML = '<tr><td colspan="4">No fills today</td></tr>';
-    }
-
-    document.getElementById('refreshed').textContent =
-      'Last update: ' + new Date().toLocaleTimeString();
-  } catch(e) {
-    console.error('refresh failed', e);
-  }
+function fmtTime(ts) {
+  if (!ts || ts < 1000000000000) ts = (ts || Date.now()/1000) * 1000;
+  return new Date(ts).toLocaleTimeString();
 }
-refresh();
-setInterval(refresh, 5000);
+
+function fmtUSD(n) { return '$' + Number(n || 0).toFixed(2); }
+
+function setConn(ok) {
+  const d = document.getElementById('conn-dot');
+  d.className = 'connection-dot ' + (ok ? 'dot-live' : 'dot-dead');
+  document.getElementById('conn-status').textContent = ok ? 'Live (SSE)' : 'Disconnected';
+}
+
+function addEvent(evt) {
+  events.push(evt);
+  if (events.length > MAX_EVENTS) events.shift();
+  const body = document.getElementById('events-body');
+  const tagClass = {
+    tick: 'tag-tick', order_place: 'tag-order', state_change: 'tag-tick',
+    risk: 'tag-risk', toxic: 'tag-toxic', spike: 'tag-spike',
+    shutdown: 'tag-shutdown', error: 'tag-risk'
+  };
+  const html = events.map(e => {
+    const tc = tagClass[e.type] || 'tag-tick';
+    const detail = e.type === 'tick'
+      ? 'mid=' + fmtUSD(e.mid) + ' spread=' + (e.spread_bps||0) + 'bps toxic=' + (e.toxic_level||'?')
+      : e.type === 'order_place'
+      ? e.side + ' ' + fmtUSD(e.price) + ' x' + (e.size||0) + (e.dry_run ? ' [dry]' : '')
+      : e.type === 'risk'
+      ? e.reason || 'halted'
+      : e.type === 'toxic'
+      ? 'level=' + (e.level||'?') + ' ratio=' + (e.ratio||0)
+      : e.type === 'spike'
+      ? 'mid=' + fmtUSD(e.mid) + ' cooldown=' + (e.cooldown_ms||0) + 'ms'
+      : e.type === 'shutdown'
+      ? 'ticks=' + (e.tick_count||0) + ' uptime=' + (e.uptime||0) + 's'
+      : '';
+    return '<div class="event-row">'
+      + '<span class="event-time">' + fmtTime(e.ts) + '</span>'
+      + '<span class="event-tag ' + tc + '">' + e.type.toUpperCase() + '</span>'
+      + '<span class="event-detail">' + detail + '</span></div>';
+  }).join('');
+  body.innerHTML = html || '<div style="color:#484f58;font-size:12px;">Waiting for events...</div>';
+  body.scrollTop = body.scrollHeight;
+}
+
+function handleSSE(data) {
+  if (!data || data.type === 'connected') { setConn(true); return; }
+  addEvent(data);
+
+  // Update snapshot data from tick events
+  if (data.type === 'tick') {
+    if (data.state) document.getElementById('bot-state').textContent = data.state;
+    if (data.mid) document.getElementById('mid-price').textContent = fmtUSD(data.mid);
+    if (data.spread_bps != null) document.getElementById('spread').textContent = data.spread_bps + ' bps';
+    if (data.toxic_level) document.getElementById('toxic-level').textContent = data.toxic_level;
+    if (data.strategies) {
+      document.getElementById('strategies-body').innerHTML = data.strategies.map(s =>
+        '<div class="order-row"><span style="color:' + (s.active ? 'var(--green)' : 'var(--red)') + '">'
+        + (s.active ? '●' : '○') + '</span> ' + s.name + '</div>'
+      ).join('');
+    }
+  }
+  document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+}
+
+function connectSSE() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/api/stream');
+  eventSource.onmessage = (e) => {
+    try { handleSSE(JSON.parse(e.data)); } catch(_) {}
+  };
+  eventSource.onerror = () => { setConn(false); setTimeout(connectSSE, 3000); };
+  eventSource.onopen = () => setConn(true);
+}
+
+// Also poll /api/snapshot for full state at slower rate
+async function pollSnapshot() {
+  try {
+    const r = await fetch('/api/snapshot');
+    if (!r.ok) return;
+    const s = await r.json();
+    document.getElementById('bot-state').textContent = s.state || '--';
+    document.getElementById('mid-price').textContent = fmtUSD(s.mid);
+    document.getElementById('spread').textContent = (s.spread_bps || 0) + ' bps';
+    document.getElementById('toxic-level').textContent = s.toxic_level || 'NORMAL';
+    document.getElementById('open-orders').textContent = s.open_orders ?? '--';
+    document.getElementById('tick-uptime').textContent =
+      '#' + (s.tick || 0) + ' / ' + (s.uptime || 0) + 's';
+    if (s.order_list) {
+      const body = document.getElementById('orders-body');
+      body.innerHTML = s.order_list.length
+        ? s.order_list.map(o =>
+            '<div class="order-row"><span class="' + (o.side === 'buy' ? 'green' : 'red') + '">'
+            + o.side.toUpperCase() + '</span> ' + fmtUSD(o.price)
+            + ' <span style="color:#484f58">x' + o.size + '</span></div>'
+          ).join('')
+        : '<div style="color:#484f58;font-size:12px;">No active orders</div>';
+    }
+    document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+  } catch(_) {}
+}
+
+connectSSE();
+setInterval(pollSnapshot, 3000);
 </script>
 </body>
 </html>"""

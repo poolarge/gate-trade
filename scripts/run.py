@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 import structlog
+import uvicorn
 
 from gate_trade.alert.manager import AlertManager
 from gate_trade.bot import Bot
@@ -34,6 +35,7 @@ from gate_trade.client.gate_client import GateIoClient
 from gate_trade.config.schema import AppConfig
 from gate_trade.guardrails.logging import setup_logging
 from gate_trade.guardrails.rate_limiter import RateLimiter
+from gate_trade.persistence.sqlite import SqlitePersistence
 from gate_trade.market.market_data import LiveMarketData
 from gate_trade.markout.recorder import MarkoutRecorder
 from gate_trade.markout.response import ToxicResponse
@@ -81,6 +83,17 @@ def _tick_size_for_pair(pair: str) -> float:
         if pair.startswith(prefix):
             return tick
     return 0.01
+
+
+async def _start_web_panel(bot: Bot, host: str = "0.0.0.0", port: int = 39120) -> uvicorn.Server:
+    from gate_trade.web import panel
+
+    panel.bind_bot(bot)
+    config = uvicorn.Config(app=panel.app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    logger.info("web_panel_starting", host=host, port=port)
+    await server.serve()
+    return server
 
 
 async def _run_synthetic_feed(
@@ -135,6 +148,7 @@ async def _run_live(
     pair: str,
     tick_interval: float,
     duration_sec: float,
+    db_path: str,
 ) -> None:
     logger.info("live_mode_initializing", pair=pair)
 
@@ -179,8 +193,10 @@ async def _run_live(
     alert = AlertManager()
     if config.monitoring.alert_webhook_url:
         from gate_trade.alert.manager import TelegramChannel
-        # Parse bot token and chat_id from webhook-like URL
         alert.add(TelegramChannel(bot_token="", chat_id=""))
+
+    persistence = SqlitePersistence(db_path)
+    persistence.open()
 
     bot = Bot(
         state_machine=sm,
@@ -193,6 +209,8 @@ async def _run_live(
         toxic=toxic,
         toxic_response=tox_resp,
         alert=alert,
+        persistence=persistence,
+        pair=pair,
         dry_run=False,
         tick_interval=tick_interval,
     )
@@ -201,6 +219,7 @@ async def _run_live(
         asyncio.create_task(_run_ws_orderbook_feed(client, md, pair)),
         asyncio.create_task(_run_ws_orders_feed(client, oe, pair)),
     ]
+    panel_task = asyncio.create_task(_start_web_panel(bot))
 
     try:
         if duration_sec > 0:
@@ -214,9 +233,14 @@ async def _run_live(
     finally:
         for task in feed_tasks:
             task.cancel()
+        panel_task.cancel()
         await asyncio.gather(*feed_tasks, return_exceptions=True)
+        with contextlib.suppress(asyncio.CancelledError):
+            await panel_task
         with contextlib.suppress(Exception):
             await client.close()
+        with contextlib.suppress(Exception):
+            persistence.close()
 
 
 async def _run_dry(
@@ -224,6 +248,7 @@ async def _run_dry(
     pair: str,
     tick_interval: float,
     duration_sec: float,
+    db_path: str,
 ) -> None:
     logger.info("dry_run_initializing", pair=pair)
 
@@ -260,6 +285,9 @@ async def _run_dry(
     tox_resp = ToxicResponse()
     alert = AlertManager()
 
+    persistence = SqlitePersistence(db_path)
+    persistence.open()
+
     bot = Bot(
         state_machine=sm,
         market_data=md,
@@ -271,6 +299,8 @@ async def _run_dry(
         toxic=toxic,
         toxic_response=tox_resp,
         alert=alert,
+        persistence=persistence,
+        pair=pair,
         dry_run=True,
         tick_interval=tick_interval,
     )
@@ -284,6 +314,7 @@ async def _run_dry(
     md.apply_snapshot(fake_book)
 
     feed_task = asyncio.create_task(_run_synthetic_feed(md, tick_interval, start_price=50000.0))
+    panel_task = asyncio.create_task(_start_web_panel(bot))
 
     try:
         if duration_sec > 0:
@@ -296,8 +327,13 @@ async def _run_dry(
             await bot.run()
     finally:
         feed_task.cancel()
+        panel_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await feed_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await panel_task
+        with contextlib.suppress(Exception):
+            persistence.close()
 
     # Print summary
     print()
@@ -307,6 +343,7 @@ async def _run_dry(
     print(f"  Ticks processed:  {bot.tick_count:>8,}")
     print(f"  Uptime:           {bot.uptime_seconds:>7.1f}s")
     print(f"  Strategies:       {', '.join(s.name for s in bot._strategies)}")
+    print(f"  DB:               {db_path}")
     print("=" * 56)
 
 
@@ -322,6 +359,8 @@ def main() -> None:
                         help="Seconds between ticks")
     parser.add_argument("--duration", type=float, default=0,
                         help="Stop after N seconds (0 = run forever)")
+    parser.add_argument("--data-dir", default="data",
+                        help="Directory for SQLite database and log files")
     args = parser.parse_args()
 
     if args.live:
@@ -340,20 +379,27 @@ def main() -> None:
         print("ERROR: No trading pair specified. Use --pair BTC_USDT")
         sys.exit(1)
 
-    setup_logging(level=config.logging.level, json_format=config.logging.json_format)
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    log_file = str(data_dir / "bot.log")
+    db_path = str(data_dir / "gate_trade.db")
+
+    setup_logging(level=config.logging.level, json_format=config.logging.json_format,
+                  log_file=log_file)
 
     print(f"Gate Trade Bot — {'LIVE' if args.live else 'DRY-RUN'} mode")
     print(f"  Pair:           {pair}")
     print(f"  Tick interval:  {args.tick_interval}s")
     print(f"  Config:         {args.config}")
+    print(f"  Data dir:       {data_dir}")
     if args.duration:
         print(f"  Duration:       {args.duration}s")
     print()
 
     if args.live:
-        asyncio.run(_run_live(config, pair, args.tick_interval, args.duration))
+        asyncio.run(_run_live(config, pair, args.tick_interval, args.duration, db_path))
     else:
-        asyncio.run(_run_dry(config, pair, args.tick_interval, args.duration))
+        asyncio.run(_run_dry(config, pair, args.tick_interval, args.duration, db_path))
 
 
 if __name__ == "__main__":
