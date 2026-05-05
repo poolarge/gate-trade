@@ -34,12 +34,16 @@ class LiveRiskManager(RiskManager):
         max_open_orders: int = 10,
         flash_crash_threshold_pct: float = 5.0,
         hit_cap_cooldown_ms: int = 30000,
+        pair: str = "",
     ) -> None:
         self._max_position = max_position_notional
         self._max_order_size = max_order_size_notional
         self._max_orders = max_open_orders
         self._flash_threshold = flash_crash_threshold_pct / 100.0
         self._hit_cap_cooldown_ms = hit_cap_cooldown_ms
+
+        # Derive base currency from pair (e.g. "BTC_USDT" → "BTC")
+        self._base_currency = pair.split("_")[0] if "_" in pair else ""
 
         # State
         self._halted: bool = False
@@ -133,13 +137,20 @@ class LiveRiskManager(RiskManager):
         balances: list[Balance],
         mid_price: float,
     ) -> None:
-        """Compute total notional position from open buy orders and base balance."""
+        """Compute total notional position from open buy orders and base balance.
+
+        Only considers the base currency of the trading pair (e.g. BTC for BTC_USDT),
+        not all non-zero balances indiscriminately.
+        """
         if mid_price <= 0:
             self._position_breached = False
             return
 
-        # Base currency (e.g., BTC) held
-        base_held = sum(b.total for b in balances if b.total > 0) or 0.0
+        # Base currency held — filter by the pair's base currency if known
+        if self._base_currency:
+            base_held = sum(b.total for b in balances if b.currency == self._base_currency)
+        else:
+            base_held = sum(b.total for b in balances if b.total > 0) or 0.0
 
         # Orders not yet filled that would add to position
         pending_buys = sum(o.size - o.filled_size for o in open_orders

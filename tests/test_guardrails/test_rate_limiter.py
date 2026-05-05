@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from gate_trade.guardrails.rate_limiter import RateLimiter, RateLimitExceeded
+from gate_trade.guardrails.rate_limiter import RateLimiter
 
 
 class TestRateLimiter:
@@ -30,8 +30,7 @@ class TestRateLimiter:
         # burst=1, then consume it; refill at 0.1/s with 50ms wait won't produce another token
         rl = RateLimiter(burst=1, rate=0.1, max_wait_sec=0.05)
         assert await rl.acquire()  # consume the burst token
-        with pytest.raises(RateLimitExceeded):
-            await rl.acquire()
+        assert not await rl.acquire()  # no token within max_wait — degraded
 
     def test_reset_refills(self):
         rl = RateLimiter(burst=3, rate=10.0)

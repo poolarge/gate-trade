@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import smtplib
-import urllib.parse
-import urllib.request
 from email.mime.text import MIMEText
 from enum import Enum
 
+import httpx
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -46,13 +45,13 @@ class TelegramChannel(AlertChannel):
             emoji = {"INFO": "ℹ️", "WARN": "⚠️", "CRITICAL": "🚨"}.get(level.value, "")
             text = f"{emoji} *{subject}*\n\n{body}"
             url = f"https://api.telegram.org/bot{self._token}/sendMessage"
-            payload = urllib.parse.urlencode({
-                "chat_id": self._chat_id,
-                "text": text,
-                "parse_mode": "Markdown",
-            }).encode()
-            req = urllib.request.Request(url, data=payload, method="POST")
-            await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(url, data={
+                    "chat_id": self._chat_id,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                })
+                resp.raise_for_status()
             return True
         except Exception:
             logger.exception("telegram_alert_failed", subject=subject)
@@ -93,6 +92,28 @@ class EmailChannel(AlertChannel):
             return True
         except Exception:
             logger.exception("email_alert_failed", subject=subject)
+            return False
+
+
+class WebhookChannel(AlertChannel):
+    """Sends alerts via a generic HTTP webhook (POST JSON)."""
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+
+    async def send(self, level: AlertLevel, subject: str, body: str) -> bool:
+        if not self._url:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    self._url,
+                    json={"level": level.value, "subject": subject, "body": body},
+                )
+                resp.raise_for_status()
+            return True
+        except Exception:
+            logger.exception("webhook_alert_failed", subject=subject)
             return False
 
 

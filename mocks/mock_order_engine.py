@@ -32,7 +32,7 @@ class MockOrderEngine(OrderEngine):
         self.cancel_all_calls: list[str] = []
         self.reconcile_calls: list[str] = []
 
-    async def place(self, req: OrderRequest) -> Order:
+    async def place(self, req: OrderRequest, ref_price: float = 0.0) -> Order:
         self.place_calls.append(req)
         oid = str(self._next_id)
         self._next_id += 1

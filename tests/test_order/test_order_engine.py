@@ -59,7 +59,7 @@ class TestPlace:
 
     async def test_place_uses_client_order_id_when_provided(self, engine):
         req = OrderRequest(pair="BTC_USDT", side=Side.BUY, price=50000.0, size=0.01, client_order_id="my_custom_tag")
-        order = await engine.place(req)
+        _order = await engine.place(req)
         assert engine.order_by_tag("my_custom_tag") is not None
 
     async def test_place_auto_generates_tag(self, engine):
@@ -83,7 +83,7 @@ class TestCancel:
 
     async def test_cancel_by_tag(self, engine):
         req = OrderRequest(pair="BTC_USDT", side=Side.BUY, price=50000.0, size=0.01, client_order_id="t1")
-        order = await engine.place(req)
+        _order = await engine.place(req)
         ok = await engine.cancel_by_tag("t1")
         assert ok is True
 

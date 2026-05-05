@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from mocks.mock_persistence import MockPersistence
 from gate_trade.types import BotState, Order, OrderStatus, Side
+from mocks.mock_persistence import MockPersistence
 
 
 @pytest.fixture

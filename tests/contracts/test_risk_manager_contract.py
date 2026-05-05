@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from gate_trade.types import Balance, Order, Side
 from mocks.mock_risk_manager import MockRiskManager
-from gate_trade.types import Balance, Order, OrderStatus, Side
 
 
 @pytest.fixture

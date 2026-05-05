@@ -26,7 +26,7 @@ class LiveMarketData(MarketData):
     N is the number of book levels.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, flash_crash_threshold_pct: float = 5.0) -> None:
         self._bids: list[OrderBookLevel] = []
         self._asks: list[OrderBookLevel] = []
         self._bids_by_price: dict[float, float] = {}
@@ -39,6 +39,9 @@ class LiveMarketData(MarketData):
         self._history_count: int = 0
         self._cached_signals: MarketSignal | None = None
         self._signals_stale: bool = True
+
+        # Flash crash detection threshold
+        self._flash_threshold = flash_crash_threshold_pct / 100.0
 
     # ── Order book state ─────────────────────────────────────────
 
@@ -197,7 +200,7 @@ class LiveMarketData(MarketData):
         low = min(recent)
         if high <= 0:
             return False
-        return (high - low) / high >= 0.05  # 5% threshold
+        return (high - low) / high >= self._flash_threshold
 
     def _recent_mids(self) -> list[float]:
         """Return non-zero entries from the ring buffer."""

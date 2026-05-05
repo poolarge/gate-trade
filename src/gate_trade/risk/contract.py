@@ -42,6 +42,11 @@ class RiskManager(Protocol):
         """True when the bot should transition to EMERGENCY / HALTED."""
         ...
 
+    @property
+    def halt_reason(self) -> str:
+        """Human-readable reason for the current halt (empty if not halted)."""
+        ...
+
     # ── Specific checks (exposed for monitoring) ──────────────
 
     @property

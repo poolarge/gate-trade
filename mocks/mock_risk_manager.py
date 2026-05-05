@@ -16,7 +16,7 @@ class MockRiskManager(RiskManager):
         self._order_count_breached = False
         self._flash_crash = False
         self._should_resume = True
-        self.halt_reason: str = ""
+        self._halt_reason: str = ""
         self.eval_calls: list[tuple[list[Order], list[Balance], float]] = []
 
     def evaluate(self, open_orders: list[Order], balances: list[Balance], mid_price: float) -> None:
@@ -29,6 +29,10 @@ class MockRiskManager(RiskManager):
     @property
     def halted(self) -> bool:
         return self._halted
+
+    @property
+    def halt_reason(self) -> str:
+        return self._halt_reason
 
     @property
     def position_limit_breached(self) -> bool:

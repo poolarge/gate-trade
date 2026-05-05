@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from mocks.mock_state_machine import MockStateMachine
 from gate_trade.types import BotState, RunSubState
+from mocks.mock_state_machine import MockStateMachine
 
 
 @pytest.fixture

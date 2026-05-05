@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Gate.io spot unilateral accumulation + market-making bot"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "UNLICENSED" }
+license = { text = "MIT" }
 dependencies = [
     "gate-api>=7.0.0",
     "websockets>=12.0",
@@ -19,6 +19,7 @@ dependencies = [
     "orjson>=3.9",
     "fastapi>=0.100",
     "uvicorn>=0.20",
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +31,8 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.3",
     "coverage>=7.4",
+    "httpx>=0.28",
+    "bandit>=1.8",
 ]
 
 [tool.hatch.build.targets.wheel]

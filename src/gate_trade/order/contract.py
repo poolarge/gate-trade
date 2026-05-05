@@ -27,9 +27,11 @@ class OrderEngine(Protocol):
 
     # ── Lifecycle ────────────────────────────────────────────
 
-    async def place(self, req: OrderRequest) -> Order:
+    async def place(self, req: OrderRequest, ref_price: float = 0.0) -> Order:
         """Submit *req* through rate limiter. Raises RateLimitExceeded if
-        the token bucket is empty and max wait time has elapsed."""
+        the token bucket is empty and max wait time has elapsed.
+
+        *ref_price* enables price boundary protection (±20% guard)."""
         ...
 
     async def cancel(self, order_id: str) -> bool:

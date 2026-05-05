@@ -42,7 +42,7 @@ class TestSnapshot:
             bids=[(49900, 2.0), (50000, 1.0), (49800, 3.0)],
             asks=[],
         ))
-        prices = [l.price for l in md.bids]
+        prices = [level.price for level in md.bids]
         assert prices == [50000.0, 49900.0, 49800.0]
 
     def test_snapshot_sorts_asks_asc(self, md):
@@ -50,7 +50,7 @@ class TestSnapshot:
             bids=[],
             asks=[(50200, 0.5), (50100, 1.5), (50300, 0.3)],
         ))
-        prices = [l.price for l in md.asks]
+        prices = [level.price for level in md.asks]
         assert prices == [50100.0, 50200.0, 50300.0]
 
     def test_snapshot_replaces_previous(self, md):

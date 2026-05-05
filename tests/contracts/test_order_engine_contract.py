@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from mocks.mock_order_engine import MockOrderEngine
 from gate_trade.types import OrderRequest, Side
+from mocks.mock_order_engine import MockOrderEngine
 
 
 @pytest.fixture

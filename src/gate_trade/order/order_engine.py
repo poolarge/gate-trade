@@ -68,12 +68,12 @@ class LiveOrderEngine(OrderEngine):
 
     # ── Lifecycle ────────────────────────────────────────────────
 
-    async def place(self, req: OrderRequest) -> Order:
+    async def place(self, req: OrderRequest, ref_price: float = 0.0) -> Order:
         """Submit *req* through rate limiter and tick alignment."""
         self.place_calls.append(req)
 
         # Validate
-        self._validate(req)
+        self._validate(req, ref_price)
 
         # Align price to tick
         aligned = self._align_price(req.price)
@@ -91,12 +91,12 @@ class LiveOrderEngine(OrderEngine):
             client_order_id=tag,
         )
 
-        # Rate limit
-        try:
-            await self._rl.acquire()
-        except RateLimitExceeded:
-            logger.warning("rate_limit_exceeded", pair=req.pair, side=req.side.value)
-            raise
+        # Rate limit — skip this placement if token bucket is exhausted
+        if not await self._rl.acquire():
+            logger.warning("rate_limit_skip", pair=req.pair, side=req.side.value)
+            raise RateLimitExceeded(
+                f"Token bucket exhausted after {self._rl._max_wait:.1f}s — skipping placement"
+            )
 
         # Track as pending
         self._pending[tag] = _Pending(
@@ -251,7 +251,7 @@ class LiveOrderEngine(OrderEngine):
 
     # ── Internal: validation ────────────────────────────────────
 
-    def _validate(self, req: OrderRequest) -> None:
+    def _validate(self, req: OrderRequest, ref_price: float = 0.0) -> None:
         if req.price <= 0:
             raise ValueError(f"Invalid price: {req.price}")
         if req.size <= 0:
@@ -259,6 +259,19 @@ class LiveOrderEngine(OrderEngine):
         if self._align_price(req.price) != req.price:
             logger.debug("price_misaligned", requested=req.price,
                          aligned=self._align_price(req.price))
+
+        # Price boundary protection (±20% from reference price)
+        if ref_price > 0.0:
+            max_price = ref_price * 1.20
+            min_price = ref_price * 0.80
+            if req.price > max_price:
+                raise ValueError(
+                    f"Price {req.price} above max {max_price:.2f} (ref={ref_price:.2f})"
+                )
+            if req.price < min_price:
+                raise ValueError(
+                    f"Price {req.price} below min {min_price:.2f} (ref={ref_price:.2f})"
+                )
 
     # ── Internal: tags ──────────────────────────────────────────
 

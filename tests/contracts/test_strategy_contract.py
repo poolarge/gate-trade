@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from gate_trade.types import Order, OrderRequest, Side
 from mocks.mock_strategy import MockStrategy
-from gate_trade.types import Order, OrderRequest, OrderStatus, Side
 
 
 @pytest.fixture

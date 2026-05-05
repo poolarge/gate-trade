@@ -55,6 +55,12 @@ class Strategy(Protocol):
         """
         ...
 
+    # ── Market update ────────────────────────────────────────
+
+    def update_market(self, ref_price: float, spike_active: bool = False) -> None:
+        """Receive latest reference price and spike status each tick."""
+        ...
+
     # ── Health ────────────────────────────────────────────────
 
     @property

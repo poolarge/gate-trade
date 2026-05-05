@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS fills (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id      TEXT NOT NULL,
     pair          TEXT NOT NULL,
+    side          TEXT NOT NULL DEFAULT '',
     fill_price    REAL NOT NULL,
+    price         REAL NOT NULL DEFAULT 0.0,
     filled_size   REAL NOT NULL,
     created_at_ms INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
 );
@@ -153,9 +155,11 @@ class SqlitePersistence(Persistence):
     # ── Fills ────────────────────────────────────────────────────
 
     def save_fill(self, order: Order, filled_size: float, price: float) -> None:
+        # Single-threaded bot: no race between INSERT and UPDATE within one tick
         self._db.execute(
-            "INSERT INTO fills (order_id, pair, fill_price, filled_size) VALUES (?, ?, ?, ?)",
-            (order.order_id, order.pair, price, filled_size),
+            "INSERT INTO fills (order_id, pair, side, fill_price, price, filled_size) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (order.order_id, order.pair, order.side.value, price, price, filled_size),
         )
         self._db.execute(
             "UPDATE orders SET filled_size = filled_size + ?, status = CASE "
@@ -167,14 +171,15 @@ class SqlitePersistence(Persistence):
 
     def load_fills(self, pair: str, limit: int = 500) -> list[dict[str, object]]:
         rows = self._db.execute(
-            "SELECT order_id, pair, fill_price, filled_size, created_at_ms "
+            "SELECT order_id, pair, side, fill_price, price, filled_size, created_at_ms "
             "FROM fills WHERE pair = ? ORDER BY id DESC LIMIT ?",
             (pair, limit),
         ).fetchall()
         return [
             {
-                "order_id": r[0], "pair": r[1], "fill_price": r[2],
-                "filled_size": r[3], "created_at_ms": r[4],
+                "order_id": r[0], "pair": r[1], "side": r[2],
+                "fill_price": r[3], "price": r[4],
+                "filled_size": r[5], "created_at_ms": r[6],
             }
             for r in rows
         ]
@@ -194,7 +199,12 @@ class SqlitePersistence(Persistence):
         ).fetchone()
         if row is None:
             return (BotState.INIT, None)
-        return (BotState(row[0]), row[1])
+        try:
+            state = BotState(row[0])
+        except ValueError:
+            logger.warning("unknown_bot_state_in_db", raw=row[0])
+            state = BotState.INIT
+        return (state, row[1])
 
     # ── Markout (Phase 6) ────────────────────────────────────────
 

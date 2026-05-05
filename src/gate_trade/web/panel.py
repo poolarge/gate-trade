@@ -9,23 +9,28 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sqlite3
 from collections.abc import AsyncGenerator
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 app = FastAPI(title="Gate Trade Panel", version="0.2.0")
 
 DEFAULT_DB = "data/gate_trade.db"
+_ALLOWED_DB_DIRS = ["data", "/tmp"]
 
 # In-process references set by the launcher when running embedded
 _bot: Any = None
 _event_queue: asyncio.Queue[dict[str, Any]] | None = None
 _subscribers: list[asyncio.Queue[dict[str, Any]]] = []
+
+# Optional token for API access (set via GATE_WEB_TOKEN env var)
+_AUTH_TOKEN = os.environ.get("GATE_WEB_TOKEN", "")
 
 
 def bind_bot(bot: Any) -> None:
@@ -51,13 +56,35 @@ def _broadcast(event: dict[str, Any]) -> None:
         _subscribers.pop(i)
 
 
-def _open_db(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
+def _validate_db_path(db_path: str) -> Path:
+    """Prevent path traversal attacks on the database path."""
     path = Path(db_path)
+    # Block paths that traverse upward
+    if ".." in str(path):
+        raise HTTPException(status_code=403, detail="Database path not allowed")
+    return path
+
+
+def _open_db(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
+    path = _validate_db_path(db_path)
     if not path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     return con
+
+
+# ── Auth middleware ──────────────────────────────────────────────
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next: Any) -> Any:
+    """Optional token-based auth when GATE_WEB_TOKEN is set."""
+    if _AUTH_TOKEN and request.url.path.startswith("/api/"):
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {_AUTH_TOKEN}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 # ── API: Events stream (SSE) ──────────────────────────────────────
@@ -133,11 +160,11 @@ async def api_snapshot() -> JSONResponse:
         return JSONResponse({"error": "bot not connected"}, status_code=503)
 
     bot = _bot
-    md = bot._md
-    sm = bot._sm
-    tox = bot._tox_resp
+    md = bot.md
+    sm = bot.sm
+    tox = bot.toxic_response
 
-    orders = bot._oe.open_orders()
+    orders = bot.oe.open_orders()
     order_list: list[dict[str, Any]] = []
     for o in orders:
         order_list.append({
@@ -146,7 +173,7 @@ async def api_snapshot() -> JSONResponse:
         })
 
     strategies: list[dict[str, Any]] = []
-    for s in bot._strategies:
+    for s in bot.strategies:
         strategies.append({
             "name": s.name, "active": s.active,
         })
@@ -157,7 +184,7 @@ async def api_snapshot() -> JSONResponse:
         "state": sm.state.value,
         "sub_state": sm.sub_state.value if sm.sub_state else None,
         "toxic_level": tox.level.value,
-        "dry_run": bot._dry_run,
+        "dry_run": bot.dry_run,
         "mid": round(md.mid_price(), 2),
         "best_bid": round(md.best_bid(), 2),
         "best_ask": round(md.best_ask(), 2),
@@ -204,16 +231,19 @@ async def api_fills(
     try:
         con = _open_db(db)
         rows = con.execute(
-            "SELECT side, price, filled_size, created_at FROM fills "
-            "ORDER BY created_at DESC LIMIT ?", (limit,),
+            "SELECT side, price, fill_price, filled_size, created_at_ms FROM fills "
+            "ORDER BY created_at_ms DESC LIMIT ?", (limit,),
         ).fetchall()
         fills: list[dict[str, Any]] = []
         for r in rows:
             fills.append({
                 "side": r["side"],
-                "price": r["price"],
+                "price": r["price"] or r["fill_price"],
+                "fill_price": r["fill_price"],
                 "filled_size": r["filled_size"],
-                "time": datetime.fromtimestamp(r["created_at"], tz=UTC).isoformat(),
+                "time": datetime.fromtimestamp(
+                    (r["created_at_ms"] or 0) / 1000.0, tz=UTC
+                ).isoformat(),
             })
         return JSONResponse(fills)
     except FileNotFoundError:
@@ -227,11 +257,11 @@ async def api_summary(
     try:
         con = _open_db(db)
         target_day = date.today().isoformat()
-        where = f"date(created_at, 'unixepoch') = '{target_day}'"
+        where = f"date(created_at_ms / 1000, 'unixepoch') = '{target_day}'"
         row = con.execute(
             "SELECT"
-            "  COALESCE(SUM(CASE WHEN side='buy' THEN price*filled_size ELSE 0 END),0) AS buy_volume,"
-            "  COALESCE(SUM(CASE WHEN side='sell' THEN price*filled_size ELSE 0 END),0) AS sell_volume,"
+            "  COALESCE(SUM(CASE WHEN side='buy' THEN COALESCE(price,fill_price)*filled_size ELSE 0 END),0) AS buy_volume,"
+            "  COALESCE(SUM(CASE WHEN side='sell' THEN COALESCE(price,fill_price)*filled_size ELSE 0 END),0) AS sell_volume,"
             "  COALESCE(SUM(CASE WHEN side='buy' THEN filled_size ELSE 0 END),0) AS total_bought,"
             "  COALESCE(SUM(CASE WHEN side='sell' THEN filled_size ELSE 0 END),0) AS total_sold,"
             "  COUNT(*) AS fill_count"

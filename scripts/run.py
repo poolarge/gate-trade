@@ -25,6 +25,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import structlog
 import uvicorn
@@ -32,15 +33,15 @@ import uvicorn
 from gate_trade.alert.manager import AlertManager
 from gate_trade.bot import Bot
 from gate_trade.client.gate_client import GateIoClient
-from gate_trade.config.schema import AppConfig
+from gate_trade.config.schema import AppConfig, MonitoringConfig
 from gate_trade.guardrails.logging import setup_logging
 from gate_trade.guardrails.rate_limiter import RateLimiter
-from gate_trade.persistence.sqlite import SqlitePersistence
 from gate_trade.market.market_data import LiveMarketData
 from gate_trade.markout.recorder import MarkoutRecorder
 from gate_trade.markout.response import ToxicResponse
 from gate_trade.markout.toxic import ToxicDetector
 from gate_trade.order.order_engine import LiveOrderEngine
+from gate_trade.persistence.sqlite import SqlitePersistence
 from gate_trade.price.ref_price_engine import LiveRefPriceEngine
 from gate_trade.risk.risk_manager import LiveRiskManager
 from gate_trade.state.state_machine import LiveStateMachine
@@ -52,11 +53,24 @@ logger = structlog.get_logger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 _DEFAULT_CONFIG = str(_PROJECT_ROOT / "config" / "default.yaml")
+_LOCAL_CONFIG = str(_PROJECT_ROOT / "config" / "local.yaml")
+
+_PREFLIGHT_TIMEOUT_SEC = 30
 
 
 def build_config(args: argparse.Namespace) -> AppConfig:
-    config_path = args.config or _DEFAULT_CONFIG
-    config = AppConfig.from_yaml(config_path)
+    """Load config with local overrides and environment variables.
+
+    Priority (high → low):
+      1. Environment variables GATE_*
+      2. config/local.yaml (optional)
+      3. config/default.yaml
+    """
+    base_config = args.config or _DEFAULT_CONFIG
+    local_config = _LOCAL_CONFIG if Path(_LOCAL_CONFIG).exists() else None
+    config = AppConfig.from_yaml_merged(base_config, local_config)
+
+    # Environment variable overrides
     overrides: dict[str, object] = {}
     for key, value in os.environ.items():
         if key.startswith("GATE_"):
@@ -85,15 +99,88 @@ def _tick_size_for_pair(pair: str) -> float:
     return 0.01
 
 
-async def _start_web_panel(bot: Bot, host: str = "0.0.0.0", port: int = 39120) -> uvicorn.Server:
+# ── Preflight ───────────────────────────────────────────────────
+
+
+class PreflightError(Exception):
+    """Raised when a preflight check fails and the bot should not start."""
+
+
+async def _preflight(
+    client: GateIoClient,
+    md: LiveMarketData,
+    oe: LiveOrderEngine,
+    pair: str,
+    timeout_sec: float = _PREFLIGHT_TIMEOUT_SEC,
+) -> list[Any]:
+    """Run startup checks before entering the main bot loop.
+
+    Returns the list of balances retrieved.
+    """
+    logger.info("preflight_start", pair=pair)
+
+    # 1. Wait for WS connection
+    deadline = time.monotonic() + timeout_sec
+    while not client.ws.connected:
+        if time.monotonic() > deadline:
+            raise PreflightError(
+                f"WebSocket connection not established within {timeout_sec}s"
+            )
+        await asyncio.sleep(0.5)
+    logger.info("preflight_ws_ready")
+
+    # 2. Wait for first valid market data
+    while md.mid_price() <= 0:
+        if time.monotonic() > deadline:
+            raise PreflightError(
+                f"No market data received within {timeout_sec}s"
+            )
+        await asyncio.sleep(0.5)
+    logger.info("preflight_market_data_ready", mid=round(md.mid_price(), 2))
+
+    # 3. Fetch balances
+    balances: list[Any] = []
+    try:
+        balances = await client.fetch_all_balances()
+        logger.info("preflight_balances", count=len(balances))
+    except Exception:
+        logger.warning("preflight_balance_fetch_failed")
+
+    # 4. Reconcile orders
+    try:
+        orphans = await oe.reconcile(pair)
+        if orphans:
+            logger.warning("preflight_orphans", count=len(orphans))
+        else:
+            logger.info("preflight_orders_clean")
+    except Exception:
+        logger.warning("preflight_reconcile_failed")
+
+    logger.info("preflight_passed")
+    return balances
+
+
+# ── Web Panel ───────────────────────────────────────────────────
+
+
+async def _start_web_panel(
+    bot: Bot,
+    host: str | None = None,
+    port: int = 39120,
+) -> uvicorn.Server:
     from gate_trade.web import panel
 
     panel.bind_bot(bot)
+    if host is None:
+        host = os.environ.get("GATE_WEB_HOST", "127.0.0.1")
     config = uvicorn.Config(app=panel.app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     logger.info("web_panel_starting", host=host, port=port)
     await server.serve()
     return server
+
+
+# ── Synthetic feed ──────────────────────────────────────────────
 
 
 async def _run_synthetic_feed(
@@ -123,6 +210,9 @@ async def _run_synthetic_feed(
         await asyncio.sleep(tick_interval)
 
 
+# ── WS feeds ────────────────────────────────────────────────────
+
+
 async def _run_ws_orderbook_feed(
     client: GateIoClient,
     md: LiveMarketData,
@@ -143,6 +233,30 @@ async def _run_ws_orders_feed(
         pass  # Reconciliation happens via REST, WS orders are informational
 
 
+# ── Alert setup ─────────────────────────────────────────────────
+
+
+def _build_alert(cfg: MonitoringConfig) -> AlertManager:
+    """Wire up alert channels based on configuration."""
+    alert = AlertManager()
+
+    if cfg.telegram_bot_token and cfg.telegram_chat_id:
+        from gate_trade.alert.manager import TelegramChannel
+        alert.add(TelegramChannel(
+            bot_token=cfg.telegram_bot_token,
+            chat_id=cfg.telegram_chat_id,
+        ))
+
+    if cfg.alert_webhook_url:
+        from gate_trade.alert.manager import WebhookChannel
+        alert.add(WebhookChannel(url=cfg.alert_webhook_url))
+
+    return alert
+
+
+# ── Live mode ───────────────────────────────────────────────────
+
+
 async def _run_live(
     config: AppConfig,
     pair: str,
@@ -152,11 +266,16 @@ async def _run_live(
 ) -> None:
     logger.info("live_mode_initializing", pair=pair)
 
+    # Validate API keys
+    if not config.exchange.api_key or config.exchange.api_key == "REPLACE_ME":
+        print("ERROR: API key not configured. Set GATE_EXCHANGE__API_KEY and GATE_EXCHANGE__API_SECRET.")
+        print("       Or set exchange.api_key / exchange.api_secret in config/local.yaml")
+        sys.exit(1)
+
     client = GateIoClient(config)
     await client.connect()
-    logger.info("ws_connected", url=config.exchange.ws_url)
 
-    md = LiveMarketData()
+    md = LiveMarketData(flash_crash_threshold_pct=config.risk.flash_crash_threshold_pct)
     rl = RateLimiter(
         burst=config.rate_limit.burst,
         rate=config.rate_limit.rate,
@@ -172,6 +291,7 @@ async def _run_live(
         max_open_orders=config.risk.max_open_orders,
         flash_crash_threshold_pct=config.risk.flash_crash_threshold_pct,
         hit_cap_cooldown_ms=config.risk.cooldown_fill_ms,
+        pair=pair,
     )
 
     sm = LiveStateMachine()
@@ -190,10 +310,7 @@ async def _run_live(
     toxic = ToxicDetector()
     tox_resp = ToxicResponse()
 
-    alert = AlertManager()
-    if config.monitoring.alert_webhook_url:
-        from gate_trade.alert.manager import TelegramChannel
-        alert.add(TelegramChannel(bot_token="", chat_id=""))
+    alert = _build_alert(config.monitoring)
 
     persistence = SqlitePersistence(db_path)
     persistence.open()
@@ -210,10 +327,22 @@ async def _run_live(
         toxic_response=tox_resp,
         alert=alert,
         persistence=persistence,
+        client=client,
         pair=pair,
         dry_run=False,
         tick_interval=tick_interval,
     )
+
+    # Preflight checks
+    try:
+        balances = await _preflight(client, md, oe, pair)
+        bot._balances = balances
+    except PreflightError as exc:
+        logger.critical("preflight_failed", error=str(exc))
+        print(f"FATAL: {exc}")
+        persistence.close()
+        await client.close()
+        sys.exit(1)
 
     feed_tasks = [
         asyncio.create_task(_run_ws_orderbook_feed(client, md, pair)),
@@ -243,6 +372,9 @@ async def _run_live(
             persistence.close()
 
 
+# ── Dry-run mode ────────────────────────────────────────────────
+
+
 async def _run_dry(
     config: AppConfig,
     pair: str,
@@ -252,10 +384,9 @@ async def _run_dry(
 ) -> None:
     logger.info("dry_run_initializing", pair=pair)
 
-    md = LiveMarketData()
+    md = LiveMarketData(flash_crash_threshold_pct=config.risk.flash_crash_threshold_pct)
     tick_size = _tick_size_for_pair(pair)
 
-    # Use a minimal order engine that satisfies the protocol without a real client
     from mocks.mock_order_engine import MockOrderEngine
 
     oe = MockOrderEngine()
@@ -266,6 +397,7 @@ async def _run_dry(
         max_order_size_notional=config.risk.max_order_size_notional,
         max_open_orders=config.risk.max_open_orders,
         flash_crash_threshold_pct=config.risk.flash_crash_threshold_pct,
+        pair=pair,
     )
 
     sm = LiveStateMachine()
@@ -283,7 +415,7 @@ async def _run_dry(
     markout = MarkoutRecorder()
     toxic = ToxicDetector()
     tox_resp = ToxicResponse()
-    alert = AlertManager()
+    alert = _build_alert(config.monitoring)
 
     persistence = SqlitePersistence(db_path)
     persistence.open()
@@ -347,6 +479,9 @@ async def _run_dry(
     print("=" * 56)
 
 
+# ── Main ────────────────────────────────────────────────────────
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Gate Trade Bot")
     parser.add_argument("--config", default=_DEFAULT_CONFIG, help="Path to config YAML")
@@ -365,7 +500,7 @@ def main() -> None:
 
     if args.live:
         print()
-        print("  ⚠️  LIVE MODE — will place REAL orders on Gate.io")
+        print("  WARNING: LIVE MODE — will place REAL orders on Gate.io")
         print(f"     Pair: {args.pair or '(from config)'}")
         print("  Type 'yes' to confirm:", end=" ", flush=True)
         if input().strip().lower() != "yes":

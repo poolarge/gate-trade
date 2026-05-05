@@ -11,7 +11,7 @@ class RateLimiter:
 
     *burst* tokens are available immediately; tokens refill at *rate* per second.
     If the bucket is empty and *max_wait_sec* > 0, the caller will wait up to
-    that duration for a token. Raises ``RateLimitExceeded`` if the wait times out.
+    that duration for a token. Returns False if the wait times out.
     """
 
     __slots__ = ("_capacity", "_rate", "_tokens", "_max_wait", "_last_refill")
@@ -32,8 +32,8 @@ class RateLimiter:
     async def acquire(self) -> bool:
         """Try to consume one token.
 
-        Returns True on success. Waits up to *max_wait_sec* before
-        raising ``RateLimitExceeded``.
+        Returns True on success. Returns False if no token becomes
+        available within *max_wait_sec*.
         """
         deadline = time.monotonic() + self._max_wait
 
@@ -45,9 +45,7 @@ class RateLimiter:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RateLimitExceeded(
-                    f"No token available within {self._max_wait:.1f}s"
-                )
+                return False
             await asyncio.sleep(min(remaining, 0.05))
 
     def try_acquire(self) -> bool:

@@ -143,7 +143,7 @@ class LiveStateMachine(StateMachine):
             logger.debug("cooldown_blocked", state=self._state.value)
             return
         old = self._state
-        self._state = kind
+        self.transition(kind)
         self._cooldown_until = time.monotonic() + duration_ms / 1000.0
         self._cooldown_type = kind
         logger.info("cooldown_start", kind=kind.value, duration_ms=duration_ms, from_state=old.value)

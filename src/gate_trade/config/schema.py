@@ -56,6 +56,8 @@ class LoggingConfig(BaseModel):
 
 class MonitoringConfig(BaseModel):
     alert_webhook_url: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
     daily_report: bool = True
 
 

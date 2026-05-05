@@ -62,6 +62,10 @@ class GateIoClient(GateClient):
         self._api_client = ApiClient(self._api_config)
         self._spot = SpotApi(self._api_client)
 
+    @property
+    def ws(self) -> WsManager:
+        return self._ws
+
     # ── REST: Orders ─────────────────────────────────────────────
 
     async def submit_order(self, req: OrderRequest) -> Order:
@@ -255,8 +259,9 @@ class GateIoClient(GateClient):
             from gate_trade.guardrails.exceptions import RateLimitExceeded
 
             raise RateLimitExceeded(f"[{op}] exchange rate limit hit") from exc
-        logger.error("exchange_error", body=str(exc.body), **extra)
-        raise ExchangeError(f"[{op}] failed (HTTP {exc.status}): {exc.body}") from exc
+        body_safe = str(exc.body)[:200]
+        logger.error("exchange_error", body=body_safe, **extra)
+        raise ExchangeError(f"[{op}] failed (HTTP {exc.status})") from exc
 
     # ── Parsers ──────────────────────────────────────────────────
 

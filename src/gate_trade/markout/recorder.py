@@ -99,6 +99,10 @@ class MarkoutRecorder:
         self._completed.clear()
         return result
 
+    def recent_completed(self, limit: int = 50) -> list[MarkoutRecord]:
+        """Return recently completed entries without clearing (for smasher/analysis)."""
+        return list(self._completed)[-limit:]
+
     @staticmethod
     def _compute_markout_bps(record: MarkoutRecord) -> float:
         """Markout in bps. Positive = favorable (price moved in our direction)."""
@@ -112,6 +116,23 @@ class MarkoutRecorder:
         else:
             change = mid_after - record.fill_price
         return change / record.mid_at_fill * 10000.0
+
+    def flush(self) -> list[MarkoutRecord]:
+        """Force-complete all pending records with latest mid, return them.
+
+        Called at shutdown so pending markout data is not silently discarded.
+        """
+        flushed: list[MarkoutRecord] = []
+        for record, _deadline in self._pending:
+            # Fill remaining intervals with last known mid
+            for interval in MARKOUT_INTERVALS:
+                if interval not in record.mids_after:
+                    record.mids_after[interval] = self._last_mid
+            flushed.append(record)
+        self._pending.clear()
+        self._completed.extend(flushed)
+        logger.info("markout_flushed", count=len(flushed))
+        return flushed
 
     def reset(self) -> None:
         self._pending.clear()

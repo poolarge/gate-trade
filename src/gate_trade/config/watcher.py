@@ -17,6 +17,8 @@ from typing import ClassVar
 import structlog
 import yaml
 
+from gate_trade.config.schema import AppConfig
+
 logger = structlog.get_logger(__name__)
 
 # Classification of config keys by reload level
@@ -178,14 +180,7 @@ class ConfigWatcher:
 
     @staticmethod
     def _flatten(d: dict[str, object], prefix: str = "") -> dict[str, object]:
-        result: dict[str, object] = {}
-        for k, v in d.items():
-            key = f"{prefix}.{k}" if prefix else k
-            if isinstance(v, dict) and not isinstance(v, list):
-                result.update(ConfigWatcher._flatten(v, key))
-            else:
-                result[key] = v
-        return result
+        return AppConfig._flatten(d, prefix)
 
     def _diff(self, new_flat: dict[str, object]) -> list[ConfigChange]:
         changes: list[ConfigChange] = []

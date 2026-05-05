@@ -16,14 +16,24 @@ from typing import Any
 
 import structlog
 
+from gate_trade.client.contract import GateClient
+from gate_trade.market.contract import MarketData
 from gate_trade.markout.recorder import MarkoutRecorder
 from gate_trade.markout.response import ToxicResponse
 from gate_trade.markout.toxic import ToxicDetector
+from gate_trade.order.contract import OrderEngine
+from gate_trade.persistence.contract import Persistence
 from gate_trade.persistence.event_log import BotEventLogger, BotEventType
+from gate_trade.price.contract import RefPriceEngine
+from gate_trade.risk.contract import RiskManager
+from gate_trade.state.contract import StateMachine
 from gate_trade.state.cooldown import CooldownManager
-from gate_trade.types import BotState, RunSubState
+from gate_trade.strategy.contract import Strategy
+from gate_trade.types import Balance, BotState, RunSubState
 
 logger = structlog.get_logger(__name__)
+
+_BALANCE_REFRESH_INTERVAL = 10  # ticks between balance fetches
 
 
 class Bot:
@@ -31,35 +41,23 @@ class Bot:
 
     All external dependencies are injected via the constructor so
     every component can be swapped for a mock in tests.
-
-    Usage::
-
-        bot = Bot(
-            state_machine=sm,
-            market_data=md,
-            ref_price=rp,
-            strategies=[accum, depth],
-            order_engine=oe,
-            risk_manager=rm,
-            dry_run=True,
-        )
-        await bot.run()
     """
 
     def __init__(
         self,
-        state_machine: Any,       # StateMachine protocol
-        market_data: Any,         # MarketData protocol
-        ref_price: Any,           # RefPriceEngine protocol
-        strategies: list[Any],    # list[Strategy protocol]
-        order_engine: Any,        # OrderEngine protocol
-        risk_manager: Any,        # RiskManager protocol
+        state_machine: StateMachine,
+        market_data: MarketData,
+        ref_price: RefPriceEngine,
+        strategies: list[Strategy],
+        order_engine: OrderEngine,
+        risk_manager: RiskManager,
         cooldown: CooldownManager | None = None,
         markout: MarkoutRecorder | None = None,
         toxic: ToxicDetector | None = None,
         toxic_response: ToxicResponse | None = None,
         alert: Any = None,        # AlertManager protocol
-        persistence: Any = None,  # Persistence protocol
+        persistence: Persistence | None = None,
+        client: GateClient | None = None,
         pair: str = "",
         dry_run: bool = True,
         tick_interval: float = 0.5,
@@ -75,18 +73,43 @@ class Bot:
         self._toxic = toxic or ToxicDetector()
         self._tox_resp = toxic_response or ToxicResponse()
         self._alert = alert
+        self._client = client
+        self._pair = pair
         self._dry_run = dry_run
         self._tick_interval = tick_interval
+
+        self._balances: list[Balance] = []
 
         self._events = BotEventLogger(pair=pair)
         if persistence is not None:
             self._events.bind(persistence)
+            self._load_recovery_state(persistence)
 
         self._running = False
         self._tick_count = 0
         self._start_time = 0.0
 
-    # ── Public API ──────────────────────────────────────────────
+    # ── Public properties (for monitoring / panel access) ─────────
+
+    @property
+    def sm(self) -> StateMachine:
+        return self._sm
+
+    @property
+    def md(self) -> MarketData:
+        return self._md
+
+    @property
+    def oe(self) -> OrderEngine:
+        return self._oe
+
+    @property
+    def ref(self) -> RefPriceEngine:
+        return self._ref
+
+    @property
+    def risk(self) -> RiskManager:
+        return self._risk
 
     @property
     def tick_count(self) -> int:
@@ -106,13 +129,33 @@ class Bot:
     def running(self) -> bool:
         return self._running
 
+    @property
+    def balances(self) -> list[Balance]:
+        return list(self._balances)
+
+    @property
+    def strategies(self) -> list[Strategy]:
+        return list(self._strategies)
+
+    @property
+    def toxic_response(self) -> ToxicResponse:
+        return self._tox_resp
+
+    @property
+    def dry_run(self) -> bool:
+        return self._dry_run
+
     async def run(self) -> None:
         """Start the main loop. Blocks until shutdown."""
         self._running = True
         self._start_time = time.monotonic()
         if self._sm.state == BotState.INIT:
             self._sm.transition(BotState.IDLE)
-        self._sm.transition(BotState.RUNNING)
+
+        # If recovering from a crash with a cooldown state, stay in IDLE
+        # and let the next tick transition naturally
+        if self._sm.state == BotState.IDLE:
+            self._sm.transition(BotState.RUNNING)
 
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
@@ -129,7 +172,6 @@ class Bot:
                 tick_start = time.monotonic()
                 await self._tick()
 
-                # Wait for next tick, but check stop_event frequently
                 elapsed = time.monotonic() - tick_start
                 wait = max(0.0, self._tick_interval - elapsed)
                 try:
@@ -152,10 +194,10 @@ class Bot:
     async def _tick(self) -> None:
         self._tick_count += 1
 
-        # 1. Skip if bot is in emergency or not running
+        # 1. EMERGENCY / SHUTDOWN — hard stop
         if self._sm.is_emergency():
             return
-        if self._sm.state not in (BotState.RUNNING, BotState.IDLE):
+        if self._sm.state == BotState.SHUTDOWN:
             return
 
         # 2. Get market data
@@ -184,10 +226,14 @@ class Bot:
                               mid=round(mid, 2),
                               cooldown_ms=self._ref.spike_cooldown_remaining_ms)
 
-        # 5. Risk evaluation
+        # 5. Refresh balances periodically
+        if self._tick_count % _BALANCE_REFRESH_INTERVAL == 0:
+            await self._refresh_balances()
+
+        # 6. Risk evaluation — always run, even during cooldown
         self._risk.evaluate(
             open_orders=self._oe.open_orders(),
-            balances=[],  # Balances come from REST client (not in WS loop scope)
+            balances=self._balances,
             mid_price=mid,
         )
         if self._risk.halted:
@@ -198,14 +244,29 @@ class Bot:
             await self._alert_warn("Bot halted by risk manager")
             return
 
-        # 6. Update strategies
+        # 7. Update strategies
         strat_states: list[dict[str, Any]] = []
         for strat in self._strategies:
             if strat.active:
                 strat.update_market(ref, spike_active=self._ref.spike_protection_active)
             strat_states.append({"name": strat.name, "active": strat.active})
 
-        # 7. Check if we can place
+        # 8. Cooldown recovery check — cooldown states continue processing
+        if self._sm.state in (
+            BotState.COOLDOWN_FILL, BotState.COOLDOWN_CANCEL,
+            BotState.COOLDOWN_SELF_TRADE, BotState.COOLDOWN_PRICE_SPIKE,
+        ):
+            if self._sm.can_place():
+                self._sm.transition(BotState.RUNNING)
+                logger.info("cooldown_expired_resume")
+            else:
+                # Still in cooldown — place compliance depth if needed
+                if self._cooldown.compliance_depth_required():
+                    await self._place_compliance_orders()
+                self._record_tick(mid, ref, strat_states)
+                return
+
+        # 9. Check if we can place
         if not self._sm.can_place():
             self._record_tick(mid, ref, strat_states)
             return
@@ -215,13 +276,26 @@ class Bot:
             self._record_tick(mid, ref, strat_states)
             return
 
-        # 8. Place/refresh orders
+        # 10. Place/refresh orders
         await self._refresh_orders()
 
-        # 9. Update markout recorder
+        # 11. Update markout recorder
         self._markout.update_mid(mid)
 
-        # 10. Process completed markout entries
+        # 12. Smasher attack detection (integrated, lightweight)
+        if hasattr(self, '_smasher') and self._smasher is not None:
+            smasher_event = self._smasher.inspect(
+                order_book=self._md.book,
+                recent_fills=self._markout.recent_completed(),
+            )
+            if smasher_event.detected:
+                logger.warning("smasher_attack_detected",
+                              iceberg=len(smasher_event.iceberg_signals),
+                              probe=smasher_event.probe_attack)
+                self._events.record(BotEventType.ERROR, msg="smasher_attack_detected")
+                await self._smasher.respond(smasher_event, self._oe)
+
+        # 13. Process completed markout entries
         for record in self._markout.completed():
             self._toxic.evaluate(record)
             ratio = self._toxic.toxic_ratio
@@ -233,7 +307,7 @@ class Bot:
                     f"Toxic level changed: {level.value} (ratio={ratio:.1%})"
                 )
 
-        # 11. State machine sub-state management
+        # 13. State machine sub-state management
         self._manage_sub_state()
 
         # Record tick summary
@@ -245,7 +319,6 @@ class Bot:
         """Compute desired orders and reconcile with exchange."""
         self._sm.set_sub_state(RunSubState.PLACING)
 
-        # Collect desired orders from all active strategies
         desired: list[tuple[Any, Any]] = []  # (strategy, OrderRequest)
         for strat in self._strategies:
             if strat.active:
@@ -267,10 +340,9 @@ class Bot:
             self._sm.set_sub_state(RunSubState.WAITING)
             return
 
-        # Place orders
         for _strat, req in desired:
             try:
-                await self._oe.place(req)
+                await self._oe.place(req, ref_price=self._ref.ref_price)
                 self._events.record(BotEventType.ORDER_PLACE,
                                   side=req.side.value, price=req.price,
                                   size=req.size, dry_run=False)
@@ -292,8 +364,19 @@ class Bot:
                                strategy=strat.name, side=req.side.value)
                 else:
                     with contextlib.suppress(Exception):
-                        await self._oe.place(req)
+                        await self._oe.place(req, ref_price=self._ref.ref_price)
                 break  # One per strategy is enough for compliance
+
+    # ── Balance refresh ─────────────────────────────────────────
+
+    async def _refresh_balances(self) -> None:
+        """Fetch latest balances from the exchange client."""
+        if self._dry_run or self._client is None:
+            return
+        try:
+            self._balances = await self._client.fetch_all_balances()
+        except Exception:
+            logger.warning("balance_fetch_failed", exc_info=True)
 
     # ── Helpers ─────────────────────────────────────────────────
 
@@ -321,17 +404,45 @@ class Bot:
         else:
             self._sm.set_sub_state(RunSubState.WAITING)
 
+    def _load_recovery_state(self, persistence: Persistence) -> None:
+        """On startup, check if we're recovering from a crash with a risky state."""
+        try:
+            state, _ts = persistence.load_state()
+        except Exception:
+            return
+
+        if state in (
+            BotState.EMERGENCY, BotState.COOLDOWN_FILL,
+            BotState.COOLDOWN_CANCEL, BotState.COOLDOWN_SELF_TRADE,
+            BotState.COOLDOWN_PRICE_SPIKE,
+        ):
+            logger.warning("recovery_from_risky_state", state=state.value)
+            if state == BotState.EMERGENCY:
+                logger.critical("recovery_emergency_requires_manual_clear")
+                self._events.record(BotEventType.RISK,
+                                  reason="recovery_emergency",
+                                  state=state.value)
+                # Stay in INIT — caller should handle this
+
     async def _shutdown(self) -> None:
         logger.info("bot_shutting_down", tick_count=self._tick_count,
                     uptime=round(self.uptime_seconds, 1))
         self._events.record(BotEventType.SHUTDOWN, tick_count=self._tick_count,
                           uptime=round(self.uptime_seconds, 1))
         self._sm.transition(BotState.SHUTDOWN)
-        if not self._dry_run:
+
+        # Flush pending markout records
+        self._markout.flush()
+
+        if not self._dry_run and self._pair:
             try:
-                await self._oe.cancel_all("")
+                # Reconcile first to get accurate exchange state
+                await self._oe.reconcile(self._pair)
+                count = await self._oe.cancel_all(self._pair)
+                logger.info("shutdown_cancelled", count=count, pair=self._pair)
             except Exception:
                 logger.warning("cancel_all_failed_during_shutdown")
+
         await self._alert_info(
             f"Bot shut down after {self.uptime_seconds:.0f}s, {self._tick_count} ticks"
         )

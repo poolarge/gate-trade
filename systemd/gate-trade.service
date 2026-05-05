@@ -14,7 +14,7 @@ Type=simple
 WorkingDirectory=%h/gate-trade
 Environment=PYTHONUNBUFFERED=1
 Environment=GATE_CONFIG=%h/gate-trade/config/default.yaml
-ExecStart=%h/gate-trade/.venv/bin/python -m gate_trade.main
+ExecStart=%h/gate-trade/.venv/bin/python scripts/run.py --live --config %h/gate-trade/config/default.yaml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
