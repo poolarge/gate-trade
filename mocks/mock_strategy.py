@@ -16,6 +16,7 @@ class MockStrategy(Strategy):
         self.fill_events: list[tuple[Order, float]] = []
         self.state_change_events: list[tuple[str, str]] = []
         self.cancel_events: list[Order] = []
+        self.market_updates: list[tuple[float, bool]] = []
 
     @property
     def name(self) -> str:
@@ -36,6 +37,9 @@ class MockStrategy(Strategy):
     @property
     def active(self) -> bool:
         return self._active
+
+    def update_market(self, ref_price: float, spike_active: bool = False) -> None:
+        self.market_updates.append((ref_price, spike_active))
 
     # ── Test helpers ─────────────────────────────────────────
 
