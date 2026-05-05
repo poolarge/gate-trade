@@ -79,6 +79,7 @@ class Bot:
         self._tick_interval = tick_interval
 
         self._balances: list[Balance] = []
+        self._persist = persistence
 
         self._events = BotEventLogger(pair=pair)
         if persistence is not None:
@@ -225,6 +226,7 @@ class Bot:
             self._events.record(BotEventType.SPIKE,
                               mid=round(mid, 2),
                               cooldown_ms=self._ref.spike_cooldown_remaining_ms)
+            self._save_state()
 
         # 5. Refresh balances periodically
         if self._tick_count % _BALANCE_REFRESH_INTERVAL == 0:
@@ -241,6 +243,7 @@ class Bot:
             self._sm.transition(BotState.EMERGENCY)
             self._events.record(BotEventType.RISK, reason=self._risk.halt_reason,
                               mid=round(mid, 2), state="EMERGENCY")
+            self._save_state()
             await self._alert_warn("Bot halted by risk manager")
             return
 
@@ -312,6 +315,10 @@ class Bot:
 
         # Record tick summary
         self._record_tick(mid, ref, strat_states)
+
+        # Persist state periodically (every 60 ticks ≈ 30s)
+        if self._tick_count % 60 == 0:
+            self._save_state()
 
     # ── Order management ────────────────────────────────────────
 
@@ -431,6 +438,9 @@ class Bot:
                           uptime=round(self.uptime_seconds, 1))
         self._sm.transition(BotState.SHUTDOWN)
 
+        if self._persist is not None:
+            self._persist.save_state(self._sm.state, self._sm.sub_state.value if self._sm.sub_state else None)
+
         # Flush pending markout records
         self._markout.flush()
 
@@ -446,6 +456,12 @@ class Bot:
         await self._alert_info(
             f"Bot shut down after {self.uptime_seconds:.0f}s, {self._tick_count} ticks"
         )
+
+    def _save_state(self) -> None:
+        """Persist current state machine status for crash recovery."""
+        if self._persist is not None:
+            sub = self._sm.sub_state.value if self._sm.sub_state else None
+            self._persist.save_state(self._sm.state, sub)
 
     async def _alert_critical(self, msg: str) -> None:
         if self._alert:

@@ -206,6 +206,7 @@ async def api_health() -> dict[str, str]:
 
 @app.get("/api/status")
 async def api_status(db: str = Query(default=DEFAULT_DB)) -> JSONResponse:
+    _validate_db_path(db)
     if _bot is not None:
         return await api_snapshot()
     try:
