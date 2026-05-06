@@ -1,0 +1,35 @@
+# Test live config — used for test sessions
+# API keys in config/local.yaml
+
+trading:
+  target_pair: QKA_USDT
+  min_order_size: 1.0
+
+risk:
+  max_position_notional: 20.0
+  max_order_size_notional: 5.0
+  max_open_orders: 1
+  cooldown_fill_ms: 2000
+  cooldown_cancel_ms: 1000
+  cooldown_self_trade_ms: 5000
+  flash_crash_threshold_pct: 5.0
+
+rate_limit:
+  burst: 10
+  rate: 8.0
+  max_wait_sec: 5.0
+
+ws:
+  ping_interval_sec: 15
+  reconnect_delay_sec: 2.0
+  max_reconnect_attempts: 0
+
+logging:
+  level: "INFO"
+  json_format: true
+
+monitoring:
+  alert_webhook_url: ""
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  daily_report: false
