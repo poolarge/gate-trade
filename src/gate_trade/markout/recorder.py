@@ -105,14 +105,19 @@ class MarkoutRecorder:
 
     @staticmethod
     def _compute_markout_bps(record: MarkoutRecord) -> float:
-        """Markout in bps. Positive = favorable (price moved in our direction)."""
+        """Markout in bps (accumulation strategy).
+
+        BUY:  fill_price - mid_after → positive when price dropped after buy
+              (price down = more accumulation at cheaper prices = good)
+        SELL: mid_after - fill_price → has no specific accumulation meaning here
+        """
         if record.mid_at_fill <= 0:
             return 0.0
         # Use the longest available interval
         mid_after = record.mids_after.get(max(MARKOUT_INTERVALS), record.mid_at_fill)
         change = mid_after - record.mid_at_fill
         if record.side == Side.BUY:
-            change = record.fill_price - mid_after
+            change = record.fill_price - mid_after  # price drop after buy → more accumulation at better prices → favorable
         else:
             change = mid_after - record.fill_price
         return change / record.mid_at_fill * 10000.0
